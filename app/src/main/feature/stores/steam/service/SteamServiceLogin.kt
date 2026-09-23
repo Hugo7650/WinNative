@@ -325,12 +325,14 @@ internal fun SteamService.Companion.installWnLogonObserver(session: WnSteamSessi
     wnLibrary?.stopObserving()
     val library = WnLibraryStore(session)
     wnLibrary = library
+    resetLibrarySyncProgress()
     library.startObserving()
     // The first delta is a full baseline. Later emissions contain only entities
     // changed since the previous native revision, so the mirror no longer walks
     // the entire owned library after every PICS observer notification.
     wnLibraryMirrorJob = instance?.scope?.launch(Dispatchers.Default) {
         library.updates.collect { delta ->
+            _librarySyncProgress.value = library.progress.value
             Timber.i(
                 "WnLibrary delta r%d: %d packages, %d owned apps changed (%d owned / %d tracked)",
                 delta.revision,

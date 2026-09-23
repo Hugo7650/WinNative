@@ -63,6 +63,7 @@ import com.winlator.cmod.feature.stores.steam.wnsteam.WnDownloadListener
 import com.winlator.cmod.feature.stores.steam.wnsteam.WnAuthResult
 import com.winlator.cmod.feature.stores.steam.wnsteam.WnAuthenticator
 import com.winlator.cmod.feature.stores.steam.wnsteam.WnLibraryStore
+import com.winlator.cmod.feature.stores.steam.wnsteam.WnLibrarySyncProgress
 import com.winlator.cmod.feature.stores.steam.wnsteam.WnQrCallback
 import com.winlator.cmod.feature.stores.steam.wnsteam.WnSteamSession
 import com.winlator.cmod.feature.stores.steam.wnsteam.WnSteamStateObserver
@@ -602,6 +603,13 @@ class SteamService : Service() {
         @Volatile var wnLibrary: WnLibraryStore? = null
             internal set
         @Volatile internal var wnLibraryMirrorJob: Job? = null
+
+        internal val _librarySyncProgress = MutableStateFlow(WnLibrarySyncProgress.EMPTY)
+        val librarySyncProgress = _librarySyncProgress.asStateFlow()
+
+        internal fun resetLibrarySyncProgress() {
+            _librarySyncProgress.value = WnLibrarySyncProgress.EMPTY
+        }
 
         /** Keeps [isConnectedFlow] in sync with the live socket; only touches the connected flow (writing isLoggedInFlow from a read flipped the UI to "signed out" on CM load-balancing). */
         fun syncStates() {
@@ -3710,6 +3718,7 @@ class SteamService : Service() {
             wnLibraryMirrorJob = null
             wnLibrary?.stopObserving()
             wnLibrary = null
+            resetLibrarySyncProgress()
 
             // Tear down the logon session after observers are quiesced so delayed library refreshes can't touch a closing native handle.
             wnSession?.let { s ->
@@ -4316,6 +4325,7 @@ class SteamService : Service() {
         wnLibraryMirrorJob = null
         wnLibrary?.stopObserving()
         wnLibrary = null
+        resetLibrarySyncProgress()
         wnSession?.let { s ->
             runCatching { s.disconnect() }
             runCatching { s.close() }

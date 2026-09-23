@@ -207,6 +207,7 @@ import com.winlator.cmod.feature.stores.steam.enums.DownloadPhase
 import com.winlator.cmod.feature.stores.steam.events.AndroidEvent
 import com.winlator.cmod.feature.stores.steam.events.EventDispatcher
 import com.winlator.cmod.feature.stores.steam.service.SteamService
+import com.winlator.cmod.feature.stores.steam.wnsteam.WnLibrarySyncProgress
 import com.winlator.cmod.feature.stores.steam.utils.PrefManager
 import com.winlator.cmod.feature.stores.steam.utils.getAvatarURL
 import com.winlator.cmod.feature.sync.CloudSyncHelper
@@ -351,6 +352,7 @@ internal fun UnifiedActivity.UnifiedHub() {
         if (!drawerState.isOpen) drawerNavBridge.controllerActive = false
     }
     val isLoggedIn by SteamService.isLoggedInFlow.collectAsState()
+    val steamLibrarySyncProgress by SteamService.librarySyncProgress.collectAsState()
     val chatServiceEnabled by SteamService.chatServiceEnabledFlow.collectAsState()
     val isEpicLoggedIn by EpicAuthManager.isLoggedInFlow.collectAsState()
     val isGogLoggedIn by GOGAuthManager.isLoggedInFlow.collectAsState()
@@ -1058,6 +1060,7 @@ internal fun UnifiedActivity.UnifiedHub() {
                             isLoggedIn = isLoggedIn,
                             steamApps = filteredInstalledSteamApps,
                             steamOwnedApps = filteredSteamOwnedAppSummaries,
+                            steamSyncProgress = steamLibrarySyncProgress,
                             epicApps = epicApps,
                             gogApps = gogApps,
                             layoutMode = libraryLayoutMode,
@@ -2089,6 +2092,7 @@ internal fun UnifiedActivity.LibraryCarousel(
     isLoggedIn: Boolean,
     steamApps: List<SteamApp>,
     steamOwnedApps: List<SteamAppSummary>,
+    steamSyncProgress: WnLibrarySyncProgress,
     epicApps: List<EpicGame>,
     gogApps: List<GOGGame>,
     layoutMode: LibraryLayoutMode,
@@ -2660,9 +2664,17 @@ internal fun UnifiedActivity.LibraryCarousel(
     // "No games installed". This resolves itself once the store populates its
     // DB (steamApps/epicApps/gogApps become non-empty) or if other sources
     // (custom apps, other stores) already have installed games.
+    val steamSyncIncomplete =
+        isLoggedIn &&
+            (
+                steamOwnedApps.isEmpty() ||
+                    (steamSyncProgress.totalPackages > 0 && !steamSyncProgress.packageDiscoveryComplete) ||
+                    (steamSyncProgress.totalOwnedApps > 0 &&
+                        steamSyncProgress.fetchedOwnedApps < steamSyncProgress.totalOwnedApps)
+            )
     val awaitingStoreSync =
         installedApps.isEmpty() && (
-            (isLoggedIn && steamOwnedApps.isEmpty()) ||
+            steamSyncIncomplete ||
                 (epicApps.isEmpty() && EpicService.hasStoredCredentials(context)) ||
                 (gogApps.isEmpty() && GOGAuthManager.isLoggedIn(context))
         )
@@ -2680,11 +2692,70 @@ internal fun UnifiedActivity.LibraryCarousel(
                 animationSpec = tween(durationMillis = 600),
                 label = "loaderFade",
             )
-            CircularProgressIndicator(
-                color = Accent,
-                strokeWidth = 3.dp,
-                modifier = Modifier.size(48.dp).alpha(spinAlpha),
-            )
+            Column(
+                horizontalAlignment = Alignment.CenterHorizontally,
+                verticalArrangement = Arrangement.Center,
+            ) {
+                CircularProgressIndicator(
+                    color = Accent,
+                    strokeWidth = 3.dp,
+                    modifier = Modifier.size(48.dp).alpha(spinAlpha),
+                )
+
+                val packageStage =
+                    isLoggedIn &&
+                        steamSyncProgress.totalPackages > 0 &&
+                        !steamSyncProgress.packageDiscoveryComplete
+                val progressTotal =
+                    if (packageStage) {
+                        steamSyncProgress.totalPackages
+                    } else {
+                        steamSyncProgress.totalOwnedApps
+                    }
+                val progressLoaded =
+                    if (packageStage) {
+                        steamSyncProgress.fetchedPackages
+                    } else {
+                        steamSyncProgress.fetchedOwnedApps
+                    }
+                if (isLoggedIn && progressTotal > 0) {
+                    val fraction = steamSyncProgress.fraction
+                    val percent = (fraction * 100f).toInt().coerceIn(0, 100)
+                    Spacer(Modifier.height(16.dp))
+                    Text(
+                        text =
+                            if (packageStage) {
+                                "Discovering Steam library · $percent%"
+                            } else {
+                                "Loading Steam metadata · $percent%"
+                            },
+                        color = TextPrimary,
+                        fontSize = 14.sp,
+                        fontWeight = FontWeight.SemiBold,
+                    )
+                    Spacer(Modifier.height(8.dp))
+                    Box(
+                        Modifier
+                            .width(240.dp)
+                            .height(6.dp)
+                            .clip(RoundedCornerShape(999.dp))
+                            .background(MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.55f)),
+                    ) {
+                        Box(
+                            Modifier
+                                .fillMaxHeight()
+                                .fillMaxWidth(fraction)
+                                .background(Accent),
+                        )
+                    }
+                    Spacer(Modifier.height(7.dp))
+                    Text(
+                        text = "$progressLoaded / $progressTotal",
+                        color = TextSecondary,
+                        fontSize = 12.sp,
+                    )
+                }
+            }
         }
         return
     }
