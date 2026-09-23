@@ -162,8 +162,8 @@ class WnLibraryStore(private val session: WnSteamSession) {
             ownedAppsCount = delta.ownedAppsCount
             lastRevision = delta.revision
 
-            updateChannel.trySend(delta).onFailure {
-                Timber.tag(TAG).w(it, "failed to enqueue library delta revision=%d", delta.revision)
+            if (!updateChannel.trySend(delta).isSuccess) {
+                Timber.tag(TAG).w("failed to enqueue library delta revision=%d", delta.revision)
             }
 
             // Preserve the old snapshot API without paying O(N) on every native
