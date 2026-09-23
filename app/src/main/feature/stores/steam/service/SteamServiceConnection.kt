@@ -492,7 +492,7 @@ internal fun SteamService.clearValues() {
     wnLibraryMirrorJob = null
     wnLibrary?.stopObserving()
     wnLibrary = null
-    resetLibrarySyncProgress()
+    SteamService.resetLibrarySyncProgress()
 
     _unifiedFriends?.close()
     _unifiedFriends = null
