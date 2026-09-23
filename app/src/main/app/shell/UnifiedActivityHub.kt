@@ -201,6 +201,8 @@ import com.winlator.cmod.feature.stores.steam.SteamLoginActivity
 import com.winlator.cmod.feature.stores.steam.data.DepotInfo
 import com.winlator.cmod.feature.stores.steam.data.DownloadInfo
 import com.winlator.cmod.feature.stores.steam.data.SteamApp
+import com.winlator.cmod.feature.stores.steam.db.dao.SteamAppSummary
+import com.winlator.cmod.feature.stores.steam.enums.AppType
 import com.winlator.cmod.feature.stores.steam.enums.DownloadPhase
 import com.winlator.cmod.feature.stores.steam.events.AndroidEvent
 import com.winlator.cmod.feature.stores.steam.events.EventDispatcher
@@ -271,6 +273,18 @@ private const val HeaderRevealFraction = 0.5f
 private val TabLabelAutoSize =
     TextAutoSize.StepBased(minFontSize = 8.sp, maxFontSize = 13.sp, stepSize = 0.5.sp)
 
+private fun isSteamContentTypeVisible(
+    type: AppType,
+    contentFilters: Map<String, Boolean>,
+): Boolean =
+    when (type) {
+        AppType.game, AppType.demo -> contentFilters["games"] == true
+        AppType.dlc -> contentFilters["dlc"] == true
+        AppType.application -> contentFilters["applications"] == true
+        AppType.tool, AppType.config -> contentFilters["tools"] == true
+        else -> contentFilters["games"] == true
+    }
+
 @Composable
 internal fun UnifiedActivity.UnifiedHub() {
     val horizontalNavigationInsets =
@@ -338,7 +352,20 @@ internal fun UnifiedActivity.UnifiedHub() {
     val chatServiceEnabled by SteamService.chatServiceEnabledFlow.collectAsState()
     val isEpicLoggedIn by EpicAuthManager.isLoggedInFlow.collectAsState()
     val isGogLoggedIn by GOGAuthManager.isLoggedInFlow.collectAsState()
-    val steamApps by db.steamAppDao().getAllOwnedApps().collectAsState(initial = emptyList())
+    val installedSteamApps by
+        db.steamAppDao().getInstalledOwnedApps().collectAsState(initial = emptyList())
+    val steamOwnedAppSummaries by
+        db.steamAppDao().getOwnedAppSummaries().collectAsState(initial = emptyList())
+    val shouldLoadSteamCatalog = tabs.getOrNull(selectedIdx)?.key == "steam"
+    val steamCatalogFlow =
+        remember(shouldLoadSteamCatalog) {
+            if (shouldLoadSteamCatalog) {
+                db.steamAppDao().getAllOwnedApps()
+            } else {
+                kotlinx.coroutines.flow.flowOf(emptyList<SteamApp>())
+            }
+        }
+    val steamApps by steamCatalogFlow.collectAsState(initial = emptyList())
     val context = LocalContext.current
     val persona by SteamService.instance?.localPersona?.collectAsState()
         ?: remember { mutableStateOf(null) }
@@ -392,6 +419,7 @@ internal fun UnifiedActivity.UnifiedHub() {
     val isControllerConnected = controllerState.isConnected
     val isPS = controllerState.isPlayStation
     val isLibraryTab = tabs.getOrNull(selectedIdx)?.key == "library"
+    val steamSelectionApps = if (isLibraryTab) installedSteamApps else steamApps
 
     val libraryRefreshListener =
         remember {
@@ -502,18 +530,21 @@ internal fun UnifiedActivity.UnifiedHub() {
             }
         }
 
+    val contentFilterSnapshot = contentFilters.toMap()
     val filteredSteamApps =
-        remember(steamApps, contentFilters.toMap()) {
-            steamApps.filter { app ->
-                when (app.type) {
-                    com.winlator.cmod.feature.stores.steam.enums.AppType.game -> contentFilters["games"] == true
-                    com.winlator.cmod.feature.stores.steam.enums.AppType.demo -> contentFilters["games"] == true
-                    com.winlator.cmod.feature.stores.steam.enums.AppType.dlc -> contentFilters["dlc"] == true
-                    com.winlator.cmod.feature.stores.steam.enums.AppType.application -> contentFilters["applications"] == true
-                    com.winlator.cmod.feature.stores.steam.enums.AppType.tool -> contentFilters["tools"] == true
-                    com.winlator.cmod.feature.stores.steam.enums.AppType.config -> contentFilters["tools"] == true
-                    else -> contentFilters["games"] == true
-                }
+        remember(steamApps, contentFilterSnapshot) {
+            steamApps.filter { app -> isSteamContentTypeVisible(app.type, contentFilterSnapshot) }
+        }
+    val filteredInstalledSteamApps =
+        remember(installedSteamApps, contentFilterSnapshot) {
+            installedSteamApps.filter { app ->
+                isSteamContentTypeVisible(app.type, contentFilterSnapshot)
+            }
+        }
+    val filteredSteamOwnedAppSummaries =
+        remember(steamOwnedAppSummaries, contentFilterSnapshot) {
+            steamOwnedAppSummaries.filter { app ->
+                isSteamContentTypeVisible(app.type, contentFilterSnapshot)
             }
         }
 
@@ -597,7 +628,7 @@ internal fun UnifiedActivity.UnifiedHub() {
                         val epicId = if (selectedSteamAppId >= 2000000000) selectedSteamAppId - 2000000000 else 0
 
                         globalSettingsApp = (
-                            steamApps.find { it.id == selectedSteamAppId }
+                            steamSelectionApps.find { it.id == selectedSteamAppId }
                                 ?: if (isCustom) {
                                     SteamApp(id = selectedSteamAppId, name = selectedSteamAppName, developer = "Custom")
                                 } else if (epicId > 0) {
@@ -634,7 +665,7 @@ internal fun UnifiedActivity.UnifiedHub() {
                                 launchSteamGame(context, containerManager, dummyApp)
                             }
                         } else {
-                            val steam = steamApps.find { it.id == selectedSteamAppId }
+                            val steam = steamSelectionApps.find { it.id == selectedSteamAppId }
                             if (steam != null) {
                                 launchSteamGame(context, containerManager, steam)
                             }
@@ -942,7 +973,7 @@ internal fun UnifiedActivity.UnifiedHub() {
                             globalSettingsGogGame = gogApps.find { it.id == selectedGogGameId }
                         } else {
                             globalSettingsApp = (
-                                steamApps.find { it.id == selectedSteamAppId }
+                                steamSelectionApps.find { it.id == selectedSteamAppId }
                                     ?: if (selectedSteamAppId < 0) {
                                         SteamApp(
                                             id = selectedSteamAppId,
@@ -1010,7 +1041,8 @@ internal fun UnifiedActivity.UnifiedHub() {
                     ) {
                         LibraryCarousel(
                             isLoggedIn = isLoggedIn,
-                            steamApps = filteredSteamApps,
+                            steamApps = filteredInstalledSteamApps,
+                            steamOwnedApps = filteredSteamOwnedAppSummaries,
                             epicApps = epicApps,
                             gogApps = gogApps,
                             layoutMode = libraryLayoutMode,
@@ -2038,6 +2070,7 @@ private data class ShortcutScanResult(
 internal fun UnifiedActivity.LibraryCarousel(
     isLoggedIn: Boolean,
     steamApps: List<SteamApp>,
+    steamOwnedApps: List<SteamAppSummary>,
     epicApps: List<EpicGame>,
     gogApps: List<GOGGame>,
     layoutMode: LibraryLayoutMode,
@@ -2173,6 +2206,7 @@ internal fun UnifiedActivity.LibraryCarousel(
     val scanInputToken =
         remember(
             steamApps,
+            steamOwnedApps,
             epicApps,
             gogApps,
             customApps,
@@ -2259,7 +2293,7 @@ internal fun UnifiedActivity.LibraryCarousel(
                 }
             val steamInstalledIds = steamInstalled.map { it.id }.toSet()
             val ownedEntries =
-                steamApps.map { steam ->
+                steamOwnedApps.map { steam ->
                     LibraryStoreOption(
                         store = InstallStore.STEAM,
                         libraryId = steam.id,
@@ -2610,7 +2644,7 @@ internal fun UnifiedActivity.LibraryCarousel(
     // (custom apps, other stores) already have installed games.
     val awaitingStoreSync =
         installedApps.isEmpty() && (
-            (isLoggedIn && steamApps.isEmpty()) ||
+            (isLoggedIn && steamOwnedApps.isEmpty()) ||
                 (epicApps.isEmpty() && EpicService.hasStoredCredentials(context)) ||
                 (gogApps.isEmpty() && GOGAuthManager.isLoggedIn(context))
         )

@@ -6,9 +6,16 @@ import androidx.room.Query
 import androidx.room.Transaction
 import androidx.room.Update
 import com.winlator.cmod.feature.stores.steam.data.SteamApp
+import com.winlator.cmod.feature.stores.steam.enums.AppType
 import com.winlator.cmod.feature.stores.steam.service.SteamService.Companion.INVALID_PKG_ID
 import kotlin.math.min
 import kotlinx.coroutines.flow.Flow
+
+data class SteamAppSummary(
+    val id: Int,
+    val name: String,
+    val type: AppType,
+)
 
 @Dao
 interface SteamAppDao {
@@ -34,6 +41,27 @@ interface SteamAppDao {
         invalidPkgId: Int = INVALID_PKG_ID,
         // borrowedCode: Int = ELicenseFlags.Borrowed.code(),
     ): Flow<List<SteamApp>>
+
+    @Query(
+        "SELECT app.* FROM steam_app AS app " +
+            "INNER JOIN app_info AS installed ON installed.id = app.id AND installed.is_downloaded = 1 " +
+            "WHERE app.id != 480 " +
+            "AND app.package_id != :invalidPkgId " +
+            "AND app.type != 0 " +
+            "ORDER BY LOWER(app.name)",
+    )
+    fun getInstalledOwnedApps(
+        invalidPkgId: Int = INVALID_PKG_ID,
+    ): Flow<List<SteamApp>>
+
+    @Query(
+        "SELECT id, name, type FROM steam_app " +
+            "WHERE id != 480 AND package_id != :invalidPkgId AND type != 0 " +
+            "ORDER BY LOWER(name)",
+    )
+    fun getOwnedAppSummaries(
+        invalidPkgId: Int = INVALID_PKG_ID,
+    ): Flow<List<SteamAppSummary>>
 
     @Query("SELECT * FROM steam_app WHERE received_pics = 0 AND package_id != :invalidPkgId AND owner_account_id = :ownerId")
     fun getAllOwnedAppsWithoutPICS(
@@ -117,6 +145,9 @@ interface SteamAppDao {
 
     @Query("SELECT id FROM steam_app")
     suspend fun getAllAppIds(): List<Int>
+
+    @Query("SELECT id, name, type FROM steam_app")
+    suspend fun getAllAppSummaries(): List<SteamAppSummary>
 
     @Query("SELECT * FROM steam_app")
     suspend fun getAllAsList(): List<SteamApp>
