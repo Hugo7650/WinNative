@@ -1092,6 +1092,7 @@ internal fun UnifiedActivity.UnifiedHub() {
                                     SteamStoreTab(
                                         isLoggedIn,
                                         filteredSteamOwnedAppSummaries,
+                                        steamLibrarySyncProgress,
                                         searchQuery,
                                         LibraryLayoutMode.GRID_4,
                                     )
