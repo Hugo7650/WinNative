@@ -45,6 +45,7 @@ class GameID(
 data class PICSRequest(
     val id: Int,
     val accessToken: Long = 0L,
+    val retryCount: Int = 0,
 )
 
 /**

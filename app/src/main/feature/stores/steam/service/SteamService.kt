@@ -4132,12 +4132,19 @@ class SteamService : Service() {
 
         scope.launch(Dispatchers.IO) {
             try {
-                val ownedIds = appDao.getAllAppIds().toIntArray()
+                val appSummaries = appDao.getAllAppSummaries()
+                val ownedIds = appSummaries.map { it.id }.toIntArray()
                 if (ownedIds.isNotEmpty()) {
                     com.winlator.cmod.feature.stores.steam.wnsteam.WnLibSteamClient
                         .setOwnedApps(ownedIds)
                 }
-                val installed = ownedIds.filter { isAppInstalled(it) }.toIntArray()
+                val installedCandidates = appInfoDao.getAllInstalledAppIds().toHashSet()
+                val installed =
+                    ownedIds.asSequence()
+                        .filter { it in installedCandidates }
+                        .filter { isAppInstalled(it) }
+                        .toList()
+                        .toIntArray()
                 if (installed.isNotEmpty()) {
                     com.winlator.cmod.feature.stores.steam.wnsteam.WnLibSteamClient
                         .setInstalledApps(installed)
@@ -4164,13 +4171,12 @@ class SteamService : Service() {
                         }
                     }
                 }
-                val nameIds   = mutableListOf<Int>()
-                val nameStrs  = mutableListOf<String>()
-                for (id in ownedIds) {
-                    val nm = runCatching { appDao.findApp(id)?.name }.getOrNull().orEmpty()
-                    if (nm.isNotEmpty()) {
-                        nameIds.add(id)
-                        nameStrs.add(nm)
+                val nameIds = mutableListOf<Int>()
+                val nameStrs = mutableListOf<String>()
+                for (app in appSummaries) {
+                    if (app.name.isNotEmpty()) {
+                        nameIds.add(app.id)
+                        nameStrs.add(app.name)
                     }
                 }
                 if (nameIds.isNotEmpty()) {
@@ -4467,7 +4473,12 @@ class SteamService : Service() {
         scope.launch {
             try {
                 val installed = withContext(Dispatchers.IO) {
-                    appDao.getAllAppIds().filter { isAppInstalled(it) }
+                    val ownedIds = appDao.getAllAppIds().toHashSet()
+                    appInfoDao.getAllInstalledAppIds()
+                        .asSequence()
+                        .filter { it in ownedIds }
+                        .filter { isAppInstalled(it) }
+                        .toList()
                 }
                 if (installed.isEmpty()) {
                     Timber.d("post-logon ticket pre-fetch: no installed apps")
