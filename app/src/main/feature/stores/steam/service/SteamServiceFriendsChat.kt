@@ -370,6 +370,104 @@ internal fun SteamService.PICSChangesCheck() {
     }
 }
 
+private const val PICS_MAX_RETRY_ATTEMPTS = 8
+private const val PICS_RETRY_BASE_DELAY_MS = 1_000L
+private const val PICS_RETRY_MAX_DELAY_MS = 30_000L
+
+private fun SteamService.schedulePicsRetry(
+    kind: String,
+    requests: List<PICSRequest>,
+    channel: Channel<List<PICSRequest>>,
+    reason: String,
+    countAttempt: Boolean = true,
+) {
+    if (requests.isEmpty()) return
+
+    val currentAttempt = requests.maxOfOrNull { it.retryCount } ?: 0
+    val nextAttempt = if (countAttempt) currentAttempt + 1 else currentAttempt
+    if (countAttempt && nextAttempt > PICS_MAX_RETRY_ATTEMPTS) {
+        Timber.e(
+            "Dropping %d %s PICS request(s) after %d retries: %s",
+            requests.size,
+            kind,
+            PICS_MAX_RETRY_ATTEMPTS,
+            reason,
+        )
+        return
+    }
+
+    val retryRequests =
+        if (countAttempt) {
+            requests.map { it.copy(retryCount = nextAttempt) }
+        } else {
+            requests
+        }
+    val retryDelayMs =
+        if (countAttempt) {
+            val shift = (nextAttempt - 1).coerceIn(0, 5)
+            (PICS_RETRY_BASE_DELAY_MS * (1L shl shift)).coerceAtMost(PICS_RETRY_MAX_DELAY_MS)
+        } else {
+            PICS_RETRY_BASE_DELAY_MS
+        }
+
+    Timber.w(
+        "Scheduling %d %s PICS request(s) for retry%s in %d ms: %s",
+        retryRequests.size,
+        kind,
+        if (countAttempt) " $nextAttempt/$PICS_MAX_RETRY_ATTEMPTS" else "",
+        retryDelayMs,
+        reason,
+    )
+    scope.launch {
+        delay(retryDelayMs)
+        channel.send(retryRequests)
+    }
+}
+
+private suspend fun SteamService.refreshPicsTokens(
+    requests: List<PICSRequest>,
+    appTokens: Boolean,
+): List<PICSRequest> {
+    if (requests.isEmpty()) return requests
+
+    val tokens = HashMap<Int, Long>()
+    for (chunk in requests.chunked(MAX_PICS_BUFFER)) {
+        val json =
+            runCatching {
+                withWnSession { session ->
+                    withContext(Dispatchers.IO) {
+                        if (appTokens) {
+                            session.getPicsAccessTokens(chunk.map { it.id }, emptyList())
+                        } else {
+                            session.getPicsAccessTokens(emptyList(), chunk.map { it.id })
+                        }
+                    }
+                }
+            }.getOrNull() ?: continue
+
+        val key = if (appTokens) "appTokens" else "packageTokens"
+        runCatching {
+            JSONObject(json).optJSONObject(key)?.let { obj ->
+                for (tokenKey in obj.keys()) {
+                    tokens[tokenKey.toInt()] = obj.getString(tokenKey).toLongOrNull() ?: 0L
+                }
+            }
+        }.onFailure { error ->
+            Timber.w(error, "Failed to parse refreshed PICS access tokens")
+        }
+    }
+
+    if (tokens.isEmpty()) return requests
+    return requests.map { request ->
+        val token = tokens[request.id] ?: 0L
+        if (token != 0L && token != request.accessToken) {
+            request.copy(accessToken = token)
+        } else {
+            request
+        }
+    }
+}
+
 /** Buffered flow that batches bursts of PICS requests. */
 internal fun SteamService.continuousPICSGetProductInfo(): Job =
     scope.launch {
@@ -382,7 +480,16 @@ internal fun SteamService.continuousPICSGetProductInfo(): Job =
                 .collect { appRequests ->
                     Timber.d("Processing ${appRequests.size} app PICS requests")
                     ensureActive()
-                    if (!isLoggedIn) return@collect
+                    if (!isLoggedIn) {
+                        schedulePicsRetry(
+                            kind = "app",
+                            requests = appRequests,
+                            channel = appPicsChannel,
+                            reason = "session is not logged on",
+                            countAttempt = false,
+                        )
+                        return@collect
+                    }
 
                     val json =
                         withWnSession { session ->
@@ -392,21 +499,36 @@ internal fun SteamService.continuousPICSGetProductInfo(): Job =
                                     appRequests.map { it.accessToken },
                                 )
                             }
-                        } ?: return@collect
+                        }
+                    if (json == null) {
+                        schedulePicsRetry(
+                            kind = "app",
+                            requests = appRequests,
+                            channel = appPicsChannel,
+                            reason = "product-info request returned no response",
+                        )
+                        return@collect
+                    }
 
                     try {
                         val arr = JSONArray(json)
                         val steamAppsList = mutableListOf<SteamApp>()
+                        val completedIds = HashSet<Int>(arr.length())
                         for (i in 0 until arr.length()) {
                             ensureActive()
+                            val entry = arr.getJSONObject(i)
+                            val appId = entry.optInt("appid")
+                            if (appId <= 0) continue
+
                             try {
-                                val entry = arr.getJSONObject(i)
-                                val appId = entry.optInt("appid")
                                 val changeNumber = entry.optInt("changeNumber")
                                 val appinfo = entry.optJSONObject("appinfo") ?: continue
 
                                 val appFromDb = appDao.findApp(appId)
-                                if (changeNumber == appFromDb?.lastChangeNumber) continue
+                                if (changeNumber == appFromDb?.lastChangeNumber) {
+                                    completedIds.add(appId)
+                                    continue
+                                }
 
                                 val packageId = appFromDb?.packageId ?: INVALID_PKG_ID
                                 val packageFromDb =
@@ -430,18 +552,36 @@ internal fun SteamService.continuousPICSGetProductInfo(): Job =
                                             if (preserveInstallDir) existingInstallDir else generatedApp.installDir,
                                     ),
                                 )
+                                completedIds.add(appId)
                             } catch (e: Exception) {
-                                Timber.w(e, "PICS app entry decode failed")
+                                Timber.w(e, "PICS app entry decode failed for appId=$appId")
                             }
                         }
+
                         if (steamAppsList.isNotEmpty()) {
                             Timber.i("Inserting ${steamAppsList.size} PICS apps to database (wn)")
                             db.withTransaction { appDao.insertAll(steamAppsList) }
+                        }
+
+                        val missingRequests = appRequests.filter { it.id !in completedIds }
+                        if (missingRequests.isNotEmpty()) {
+                            schedulePicsRetry(
+                                kind = "app",
+                                requests = refreshPicsTokens(missingRequests, appTokens = true),
+                                channel = appPicsChannel,
+                                reason = "response omitted or failed to decode ${missingRequests.size} requested app(s)",
+                            )
                         }
                     } catch (ce: kotlin.coroutines.cancellation.CancellationException) {
                         throw ce
                     } catch (e: Exception) {
                         Timber.w(e, "PICS app batch processing failed")
+                        schedulePicsRetry(
+                            kind = "app",
+                            requests = appRequests,
+                            channel = appPicsChannel,
+                            reason = "batch processing failed: ${e.message ?: e.javaClass.simpleName}",
+                        )
                     }
                 }
         }
@@ -455,7 +595,16 @@ internal fun SteamService.continuousPICSGetProductInfo(): Job =
                 .collect { packageRequests ->
                     Timber.d("Processing ${packageRequests.size} package PICS requests")
                     ensureActive()
-                    if (!isLoggedIn) return@collect
+                    if (!isLoggedIn) {
+                        schedulePicsRetry(
+                            kind = "package",
+                            requests = packageRequests,
+                            channel = packagePicsChannel,
+                            reason = "session is not logged on",
+                            countAttempt = false,
+                        )
+                        return@collect
+                    }
 
                     val json =
                         withWnSession { session ->
@@ -465,62 +614,77 @@ internal fun SteamService.continuousPICSGetProductInfo(): Job =
                                     packageRequests.map { it.accessToken },
                                 )
                             }
-                        } ?: return@collect
+                        }
+                    if (json == null) {
+                        schedulePicsRetry(
+                            kind = "package",
+                            requests = packageRequests,
+                            channel = packagePicsChannel,
+                            reason = "product-info request returned no response",
+                        )
+                        return@collect
+                    }
 
                     val queue = mutableListOf<Int>()
+                    val completedIds = HashSet<Int>()
                     try {
                         val arr = JSONArray(json)
                         db.withTransaction {
                             for (i in 0 until arr.length()) {
                                 val pkg = arr.getJSONObject(i)
                                 val pkgId = pkg.optInt("packageid")
+                                if (pkgId <= 0) continue
+
                                 val appIds = pkg.optJSONArray("appids").toIntList()
                                 licenseDao.updateApps(pkgId, appIds)
                                 val depotIds = pkg.optJSONArray("depotids").toIntList()
                                 licenseDao.updateDepots(pkgId, depotIds)
 
                                 if (appIds.isNotEmpty()) {
-                                    // Update package_id on existing rows in one statement; insert stubs for the rest (avoids a per-app find/update/insert N+1).
                                     val existing = appDao.findExistingIds(appIds).toHashSet()
                                     appDao.setPackageIdForApps(appIds, pkgId)
-                                    val newApps = appIds.asSequence()
-                                        .filter { it !in existing }
-                                        .map { SteamApp(id = it, packageId = pkgId) }
-                                        .toList()
+                                    val newApps =
+                                        appIds.asSequence()
+                                            .filter { it !in existing }
+                                            .map { SteamApp(id = it, packageId = pkgId) }
+                                            .toList()
                                     if (newApps.isNotEmpty()) appDao.insertAll(newApps)
                                 }
                                 queue.addAll(appIds)
+                                completedIds.add(pkgId)
                             }
                         }
                     } catch (ce: kotlin.coroutines.cancellation.CancellationException) {
                         throw ce
                     } catch (e: Exception) {
                         Timber.w(e, "PICS package batch processing failed")
+                        schedulePicsRetry(
+                            kind = "package",
+                            requests = packageRequests,
+                            channel = packagePicsChannel,
+                            reason = "batch processing failed: ${e.message ?: e.javaClass.simpleName}",
+                        )
+                        return@collect
+                    }
+
+                    val missingRequests = packageRequests.filter { it.id !in completedIds }
+                    if (missingRequests.isNotEmpty()) {
+                        schedulePicsRetry(
+                            kind = "package",
+                            requests = refreshPicsTokens(missingRequests, appTokens = false),
+                            channel = packagePicsChannel,
+                            reason = "response omitted ${missingRequests.size} requested package(s)",
+                        )
                     }
 
                     if (queue.isNotEmpty()) {
-                        // App access tokens for the package's apps, then re-queue.
-                        val tokens = HashMap<Int, Long>()
-                        val tokJson =
-                            withWnSession { session ->
-                                withContext(Dispatchers.IO) {
-                                    session.getPicsAccessTokens(queue, emptyList())
-                                }
-                            }
-                        if (tokJson != null) {
-                            JSONObject(tokJson).optJSONObject("appTokens")?.let { at ->
-                                for (k in at.keys()) {
-                                    tokens[k.toInt()] = at.getString(k).toLongOrNull() ?: 0L
-                                }
-                            }
+                        refreshPicsTokens(
+                            queue.distinct().map { PICSRequest(id = it) },
+                            appTokens = true,
+                        ).chunked(MAX_PICS_BUFFER).forEach { chunk ->
+                            Timber.d("bufferedPICSGetProductInfo: Queueing ${chunk.size} for PICS")
+                            appPicsChannel.send(chunk)
                         }
-                        queue
-                            .map { PICSRequest(id = it, accessToken = tokens[it] ?: 0L) }
-                            .chunked(MAX_PICS_BUFFER)
-                            .forEach { chunk ->
-                                Timber.d("bufferedPICSGetProductInfo: Queueing ${chunk.size} for PICS")
-                                appPicsChannel.send(chunk)
-                            }
                     }
                 }
         }
