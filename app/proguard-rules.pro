@@ -64,6 +64,11 @@
 -keepclassmembers class com.github.luben.zstd.** { *; }
 -dontwarn com.github.luben.zstd.**
 
+# SnakeYAML's JavaBean introspection support references java.beans, which is
+# optional on Android. ComponentInstaller uses SafeConstructor and parses
+# manifests only as maps/lists/scalars, so this branch is unreachable.
+-dontwarn java.beans.**
+
 # Conscrypt / OkHttp use reflection to discover security providers; keep
 # the Provider names they look up by string.
 -keep class java.security.Provider { *; }
@@ -82,8 +87,21 @@
     *;
 }
 
--keep class com.winlator.cmod.shared.util.OnExtractFileListener {
+# NativeContentIO's C++ side resolves this interface and all five callbacks
+# by their exact JVM names/signatures via FindClass/GetMethodID.
+# R8 must not rename, remove, merge, or optimize them away.
+-keep interface com.winlator.cmod.shared.util.OnExtractFileListener {
+    *;
+}
+
+# The listener implementations (including ImageFsInstaller's anonymous
+# InstallProgressTracker listener) are also invoked only from JNI.
+-keepclassmembers class * implements com.winlator.cmod.shared.util.OnExtractFileListener {
     public java.io.File onExtractFile(java.io.File, long);
+    public void onExtractFileProgress(java.io.File, long);
+    public boolean mapsExtractedFiles();
+    public boolean reportsExtractedBytesOnly();
+    public void onExtractedBytes(long);
 }
 
 -keep class com.winlator.cmod.runtime.content.Downloader$DownloadListener {
