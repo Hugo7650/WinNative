@@ -53,6 +53,7 @@ class WnLibraryStore(private val session: WnSteamSession) {
 
     private val refreshScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
     private val refreshScheduled = AtomicBoolean(false)
+    private val refreshPending = AtomicBoolean(false)
     private val refreshLock = Any()
     private val scheduleLock = Any()
     private val packagesById = LinkedHashMap<Int, WnOwnedPackage>()
@@ -90,6 +91,7 @@ class WnLibraryStore(private val session: WnSteamSession) {
         val pending =
             synchronized(scheduleLock) {
                 observing = false
+                refreshPending.set(false)
                 refreshScheduled.set(false)
                 refreshJob.also { refreshJob = null }
             }
@@ -101,22 +103,30 @@ class WnLibraryStore(private val session: WnSteamSession) {
     }
 
     private fun scheduleRefresh() {
+        refreshPending.set(true)
         synchronized(scheduleLock) {
             if (!observing) return
             if (!refreshScheduled.compareAndSet(false, true)) return
             refreshJob =
                 refreshScope.launch {
                     val thisJob = coroutineContext[Job]
+                    var reschedule = false
                     try {
                         delay(250L)
+                        // All notifications received before this point are represented by
+                        // the revision we are about to fetch. A notification that arrives
+                        // during refresh() flips the flag back to true.
+                        refreshPending.set(false)
                         if (observing) refresh()
                     } finally {
                         synchronized(scheduleLock) {
                             if (refreshJob === thisJob) {
                                 refreshScheduled.set(false)
                                 refreshJob = null
+                                reschedule = observing && refreshPending.get()
                             }
                         }
+                        if (reschedule) scheduleRefresh()
                     }
                 }
         }

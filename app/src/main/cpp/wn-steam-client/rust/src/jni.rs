@@ -4216,6 +4216,7 @@ pub extern "system" fn Java_com_winlator_cmod_feature_stores_steam_wnsteam_WnSte
     else {
         return ptr::null_mut();
     };
+    handle.core.library().ingest_app_access_tokens(&response);
     let app_tokens = response
         .app_access_tokens
         .iter()
@@ -4276,6 +4277,7 @@ pub extern "system" fn Java_com_winlator_cmod_feature_stores_steam_wnsteam_WnSte
     else {
         return ptr::null_mut();
     };
+    handle.core.library().ingest_app_pics_response(&response);
     let mut apps = Vec::new();
     for app in response.apps {
         if app.buffer.is_empty() {
@@ -4334,6 +4336,7 @@ pub extern "system" fn Java_com_winlator_cmod_feature_stores_steam_wnsteam_WnSte
     ) else {
         return ptr::null_mut();
     };
+    handle.core.library().ingest_package_pics_response(&response);
     let mut packages = Vec::new();
     for package in response.packages {
         if package.buffer.is_empty() {
