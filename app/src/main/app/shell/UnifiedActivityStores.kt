@@ -189,6 +189,7 @@ import com.winlator.cmod.feature.stores.steam.SteamLoginActivity
 import com.winlator.cmod.feature.stores.steam.data.DepotInfo
 import com.winlator.cmod.feature.stores.steam.data.DownloadInfo
 import com.winlator.cmod.feature.stores.steam.data.SteamApp
+import com.winlator.cmod.feature.stores.steam.db.dao.SteamAppSummary
 import com.winlator.cmod.feature.stores.steam.enums.DownloadPhase
 import com.winlator.cmod.feature.stores.steam.events.AndroidEvent
 import com.winlator.cmod.feature.stores.steam.events.EventDispatcher
@@ -2003,7 +2004,7 @@ internal fun UnifiedActivity.GOGGameManagerDialog(
 @Composable
 internal fun UnifiedActivity.SteamStoreTab(
     isLoggedIn: Boolean,
-    steamApps: List<SteamApp>,
+    steamApps: List<SteamAppSummary>,
     searchQuery: String = "",
     layoutMode: LibraryLayoutMode = LibraryLayoutMode.GRID_4,
 ) {
@@ -2017,6 +2018,17 @@ internal fun UnifiedActivity.SteamStoreTab(
     var selectedAppForDialog by remember { mutableStateOf<SteamApp?>(null) }
     val gridState = rememberLazyGridState()
     val activity = LocalContext.current as? UnifiedActivity
+    val scope = rememberCoroutineScope()
+    val steamAppDao = remember { PluviaDatabase.getInstance(this@SteamStoreTab).steamAppDao() }
+
+    fun openApp(app: SteamAppSummary) {
+        scope.launch {
+            selectedAppForDialog =
+                withContext(Dispatchers.IO) {
+                    steamAppDao.findApp(app.id)
+                }
+        }
+    }
 
     val displayedApps =
         remember(steamApps, searchQuery) {
@@ -2026,7 +2038,8 @@ internal fun UnifiedActivity.SteamStoreTab(
                 steamApps.filter { it.name.contains(searchQuery, ignoreCase = true) }
             }
         }
-    val installStateById = rememberSteamInstallStateMap(displayedApps)
+    val displayedAppIds = remember(displayedApps) { displayedApps.map { it.id } }
+    val installStateById = rememberSteamInstallStateMap(displayedAppIds)
 
     // Sync store focus infrastructure
     LaunchedEffect(displayedApps.size) {
@@ -2039,7 +2052,7 @@ internal fun UnifiedActivity.SteamStoreTab(
     // Register A-button click callback and grid state for visible-area snapping
     DisposableEffect(displayedApps) {
         val clickCallback: (Int) -> Unit = { idx ->
-            displayedApps.getOrNull(idx)?.let { selectedAppForDialog = it }
+            displayedApps.getOrNull(idx)?.let(::openApp)
         }
         activity?.storeItemClickCallback = clickCallback
         activity?.storeGridState = gridState
@@ -2066,24 +2079,25 @@ internal fun UnifiedActivity.SteamStoreTab(
                 isInstalled = installStateById[app.id] == true,
                 listMode = true,
                 isControllerActive = ControllerHelper.isControllerConnected(),
-                onClick = {
-                    selectedAppForDialog =
-                        app
-                },
+                onClick = { openApp(app) },
             )
         }
     } else {
         val focusIndex by (activity?.storeFocusIndex ?: kotlinx.coroutines.flow.MutableStateFlow(0)).collectAsState()
-        val focusRequesters =
-            remember(displayedApps.size) {
-                List(displayedApps.size) { FocusRequester() }
-            }
-        LaunchedEffect(focusIndex, focusRequesters.size) {
-            if (searchQuery.isEmpty() && focusRequesters.isNotEmpty() && focusIndex in focusRequesters.indices) {
+        val focusRequesters = remember { mutableStateMapOf<Int, FocusRequester>() }
+        LaunchedEffect(focusIndex, displayedApps.size, searchQuery) {
+            if (searchQuery.isEmpty() && displayedApps.isNotEmpty() && focusIndex in displayedApps.indices) {
                 gridState.animateScrollToItem(focusIndex)
-                try {
-                    focusRequesters[focusIndex].requestFocus()
-                } catch (_: Exception) {
+                // LazyVerticalGrid only composes the visible window. Wait briefly for
+                // the target cell to register instead of allocating one requester per
+                // owned game up front.
+                repeat(12) {
+                    val requester = focusRequesters[focusIndex]
+                    if (requester != null) {
+                        runCatching { requester.requestFocus() }
+                        return@LaunchedEffect
+                    }
+                    kotlinx.coroutines.delay(16L)
                 }
             }
         }
@@ -2097,14 +2111,19 @@ internal fun UnifiedActivity.SteamStoreTab(
             gridState = gridState,
             keyOf = { it.id },
         ) { app, index, rowHeight ->
+            val focusRequester = remember(app.id) { FocusRequester() }
+            DisposableEffect(index, focusRequester) {
+                focusRequesters[index] = focusRequester
+                onDispose {
+                    if (focusRequesters[index] === focusRequester) {
+                        focusRequesters.remove(index)
+                    }
+                }
+            }
             Box(
-                Modifier.height(rowHeight).then(
-                    if (index in focusRequesters.indices) {
-                        Modifier.focusRequester(focusRequesters[index])
-                    } else {
-                        Modifier
-                    },
-                ),
+                Modifier
+                    .height(rowHeight)
+                    .focusRequester(focusRequester),
             ) {
                 SteamStoreCapsule(
                     app,
@@ -2113,10 +2132,7 @@ internal fun UnifiedActivity.SteamStoreTab(
                     isControllerActive =
                         ControllerHelper
                             .isControllerConnected(),
-                    onClick = {
-                        selectedAppForDialog =
-                            app
-                    },
+                    onClick = { openApp(app) },
                 )
             }
         }
@@ -2130,9 +2146,18 @@ internal fun UnifiedActivity.SteamStoreTab(
     }
 }
 
+private fun steamStoreCapsuleUrl(appId: Int): String =
+    "${SteamApp.STEAM_URL}/$appId/header.jpg"
+
+private fun steamStoreSmallCapsuleUrl(appId: Int): String =
+    "${SteamApp.STEAM_URL}/$appId/capsule_231x87.jpg"
+
+private fun steamStoreHeroUrl(appId: Int): String =
+    "${SteamApp.STEAM_URL}/$appId/library_hero.jpg"
+
 @Composable
 internal fun UnifiedActivity.SteamStoreCapsule(
-    app: SteamApp,
+    app: SteamAppSummary,
     isInstalled: Boolean,
     listMode: Boolean = false,
     isFocusedOverride: Boolean = false,
@@ -2178,7 +2203,7 @@ internal fun UnifiedActivity.SteamStoreCapsule(
                 model =
                     ImageRequest
                         .Builder(context)
-                        .data(app.getHeroUrl())
+                        .data(steamStoreHeroUrl(app.id))
                         .crossfade(300)
                         .build(),
                 contentDescription = null,
@@ -2207,7 +2232,7 @@ internal fun UnifiedActivity.SteamStoreCapsule(
                         model =
                             ImageRequest
                                 .Builder(context)
-                                .data(app.getSmallCapsuleUrl())
+                                .data(steamStoreSmallCapsuleUrl(app.id))
                                 .crossfade(300)
                                 .build(),
                         contentDescription = null,
@@ -2264,7 +2289,7 @@ internal fun UnifiedActivity.SteamStoreCapsule(
                     .weight(1f)
                     .clip(RoundedCornerShape(topStart = 16.dp, topEnd = 16.dp)),
             ) {
-                val imageUrl = app.getCapsuleUrl()
+                val imageUrl = steamStoreCapsuleUrl(app.id)
 
                 AsyncImage(
                     model =

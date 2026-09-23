@@ -1,6 +1,7 @@
 package com.winlator.cmod.feature.stores.steam.data
 import androidx.room.ColumnInfo
 import androidx.room.Entity
+import androidx.room.Index
 import androidx.room.PrimaryKey
 import com.winlator.cmod.feature.stores.steam.enums.AppType
 import com.winlator.cmod.feature.stores.steam.enums.ControllerSupport
@@ -11,7 +12,7 @@ import com.winlator.cmod.feature.stores.steam.service.SteamService
 import com.winlator.cmod.feature.stores.steam.enums.ELicenseFlags
 import java.util.EnumSet
 
-@Entity("steam_app")
+@Entity(tableName = "steam_app", indices = [Index(value = ["name"], name = "index_steam_app_name")])
 data class SteamApp(
     @PrimaryKey val id: Int,
     @ColumnInfo("package_id")

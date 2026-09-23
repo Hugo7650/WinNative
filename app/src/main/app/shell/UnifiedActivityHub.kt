@@ -260,6 +260,7 @@ import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.flow.conflate
 import kotlinx.coroutines.withContext
 import javax.inject.Inject
 import kotlin.math.abs
@@ -270,6 +271,7 @@ import kotlin.math.roundToInt
 private val StoreTabKeys = setOf("steam", "epic", "gog", "itch")
 private val HeaderCollapseTriggerDistance = 24.dp
 private const val HeaderRevealFraction = 0.5f
+private const val STEAM_CATALOG_INVALIDATION_COALESCE_MS = 1_000L
 private val TabLabelAutoSize =
     TextAutoSize.StepBased(minFontSize = 8.sp, maxFontSize = 13.sp, stepSize = 0.5.sp)
 
@@ -352,20 +354,43 @@ internal fun UnifiedActivity.UnifiedHub() {
     val chatServiceEnabled by SteamService.chatServiceEnabledFlow.collectAsState()
     val isEpicLoggedIn by EpicAuthManager.isLoggedInFlow.collectAsState()
     val isGogLoggedIn by GOGAuthManager.isLoggedInFlow.collectAsState()
-    val installedSteamApps by
-        db.steamAppDao().getInstalledOwnedApps().collectAsState(initial = emptyList())
-    val steamOwnedAppSummaries by
-        db.steamAppDao().getOwnedAppSummaries().collectAsState(initial = emptyList())
-    val shouldLoadSteamCatalog = tabs.getOrNull(selectedIdx)?.key == "steam"
-    val steamCatalogFlow =
-        remember(shouldLoadSteamCatalog) {
-            if (shouldLoadSteamCatalog) {
-                db.steamAppDao().getAllOwnedApps()
+    val selectedTabKey = tabs.getOrNull(selectedIdx)?.key ?: "library"
+    val shouldLoadLibraryData = selectedTabKey == "library"
+    val installedSteamFlow =
+        remember(shouldLoadLibraryData) {
+            if (shouldLoadLibraryData) {
+                db.steamAppDao().getInstalledOwnedApps()
             } else {
                 kotlinx.coroutines.flow.flowOf(emptyList<SteamApp>())
             }
         }
-    val steamApps by steamCatalogFlow.collectAsState(initial = emptyList())
+    val installedSteamApps by installedSteamFlow.collectAsState(initial = emptyList())
+
+    // PICS can update steam_app dozens of times during a large initial sync. Observe
+    // invalidations cheaply, coalesce bursts, then read only the lightweight store
+    // projection instead of re-materializing every heavy SteamApp row per batch.
+    val shouldLoadSteamCatalog = selectedTabKey == "library" || selectedTabKey == "steam"
+    val steamCatalogFlow =
+        remember(shouldLoadSteamCatalog) {
+            if (!shouldLoadSteamCatalog) {
+                kotlinx.coroutines.flow.flowOf(emptyList<SteamAppSummary>())
+            } else {
+                kotlinx.coroutines.flow.flow {
+                    var firstInvalidation = true
+                    db.invalidationTracker
+                        .createFlow("steam_app", emitInitialState = true)
+                        .conflate()
+                        .collect {
+                            if (!firstInvalidation) {
+                                kotlinx.coroutines.delay(STEAM_CATALOG_INVALIDATION_COALESCE_MS)
+                            }
+                            emit(db.steamAppDao().getOwnedAppSummaries())
+                            firstInvalidation = false
+                        }
+                }
+            }
+        }
+    val steamOwnedAppSummaries by steamCatalogFlow.collectAsState(initial = emptyList())
     val context = LocalContext.current
     val persona by SteamService.instance?.localPersona?.collectAsState()
         ?: remember { mutableStateOf(null) }
@@ -419,7 +444,7 @@ internal fun UnifiedActivity.UnifiedHub() {
     val isControllerConnected = controllerState.isConnected
     val isPS = controllerState.isPlayStation
     val isLibraryTab = tabs.getOrNull(selectedIdx)?.key == "library"
-    val steamSelectionApps = if (isLibraryTab) installedSteamApps else steamApps
+    val steamSelectionApps = installedSteamApps
 
     val libraryRefreshListener =
         remember {
@@ -531,10 +556,6 @@ internal fun UnifiedActivity.UnifiedHub() {
         }
 
     val contentFilterSnapshot = contentFilters.toMap()
-    val filteredSteamApps =
-        remember(steamApps, contentFilterSnapshot) {
-            steamApps.filter { app -> isSteamContentTypeVisible(app.type, contentFilterSnapshot) }
-        }
     val filteredInstalledSteamApps =
         remember(installedSteamApps, contentFilterSnapshot) {
             installedSteamApps.filter { app ->
@@ -1073,7 +1094,12 @@ internal fun UnifiedActivity.UnifiedHub() {
                                 }
 
                                 "steam" -> {
-                                    SteamStoreTab(isLoggedIn, filteredSteamApps, searchQuery, LibraryLayoutMode.GRID_4)
+                                    SteamStoreTab(
+                                        isLoggedIn,
+                                        filteredSteamOwnedAppSummaries,
+                                        searchQuery,
+                                        LibraryLayoutMode.GRID_4,
+                                    )
                                 }
 
                                 "epic" -> {

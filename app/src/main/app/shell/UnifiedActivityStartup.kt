@@ -519,13 +519,22 @@ internal fun UnifiedActivity.buildTabs(storeVisible: Map<String, Boolean>): List
 }
 
 @Composable
-internal fun UnifiedActivity.rememberSteamInstallStateMap(apps: List<SteamApp>): Map<Int, Boolean> {
+internal fun UnifiedActivity.rememberSteamInstallStateMap(appIds: List<Int>): Map<Int, Boolean> {
     var installStateMap by remember { mutableStateOf<Map<Int, Boolean>>(emptyMap()) }
 
-    LaunchedEffect(apps) {
+    LaunchedEffect(appIds) {
         installStateMap =
             withContext(Dispatchers.IO) {
-                apps.associate { it.id to SteamService.isAppInstalled(it.id) }
+                val candidates =
+                    PluviaDatabase
+                        .getInstance(this@rememberSteamInstallStateMap)
+                        .appInfoDao()
+                        .getAllInstalledAppIds()
+                        .toHashSet()
+                appIds.asSequence()
+                    .filter { it in candidates }
+                    .filter { SteamService.isAppInstalled(it) }
+                    .associateWith { true }
             }
     }
 
