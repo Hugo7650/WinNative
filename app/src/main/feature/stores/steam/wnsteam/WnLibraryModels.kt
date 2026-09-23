@@ -33,6 +33,16 @@ data class WnOwnedApp(
     val buildId: Int = 0,
 )
 
+/** Incremental native-library update since a caller-provided revision. */
+data class WnLibraryDelta(
+    val revision: Long,
+    val packages: List<WnOwnedPackage>,
+    val ownedApps: List<WnOwnedApp>,
+    val removedOwnedAppIds: List<Int>,
+    val allAppsCount: Int,
+    val ownedAppsCount: Int,
+)
+
 /** Full snapshot of the native library store. */
 data class WnLibrarySnapshot(
     val packages: List<WnOwnedPackage>,

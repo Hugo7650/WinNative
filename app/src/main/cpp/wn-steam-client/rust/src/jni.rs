@@ -1992,6 +1992,27 @@ pub extern "system" fn Java_com_winlator_cmod_feature_stores_steam_wnsteam_WnSte
 }
 
 #[no_mangle]
+pub extern "system" fn Java_com_winlator_cmod_feature_stores_steam_wnsteam_WnSteamSession_nativeGetLibraryDelta(
+    mut env: JNIEnv,
+    _class: JClass,
+    handle: jlong,
+    since_revision: jlong,
+) -> jstring {
+    let Some(handle) = (unsafe { from_session_handle_mut(handle) }) else {
+        return new_string_or_null(&mut env, "{}");
+    };
+    let since_revision = if since_revision < 0 {
+        0
+    } else {
+        since_revision as u64
+    };
+    new_string_or_null(
+        &mut env,
+        &handle.core.library().delta_json(since_revision),
+    )
+}
+
+#[no_mangle]
 pub extern "system" fn Java_com_winlator_cmod_feature_stores_steam_wnsteam_WnSteamSession_nativeStartWineBridge(
     _env: JNIEnv,
     _class: JClass,

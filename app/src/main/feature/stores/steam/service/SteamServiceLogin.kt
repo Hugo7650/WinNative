@@ -326,19 +326,25 @@ internal fun SteamService.Companion.installWnLogonObserver(session: WnSteamSessi
     val library = WnLibraryStore(session)
     wnLibrary = library
     library.startObserving()
-    // Log every snapshot transition to see when the populate pipeline completes; the flow is hot + replay=1 so late collectors get the latest snapshot.
+    // The first delta is a full baseline. Later emissions contain only entities
+    // changed since the previous native revision, so the mirror no longer walks
+    // the entire owned library after every PICS observer notification.
     wnLibraryMirrorJob = instance?.scope?.launch(Dispatchers.Default) {
-        library.snapshots.collect { snap ->
+        library.updates.collect { delta ->
             Timber.i(
-                "WnLibrary snapshot: %d packages, %d owned apps (of %d tracked)",
-                snap.packages.size, snap.ownedApps.size, snap.allAppsCount,
+                "WnLibrary delta r%d: %d packages, %d owned apps changed (%d owned / %d tracked)",
+                delta.revision,
+                delta.packages.size,
+                delta.ownedApps.size,
+                delta.ownedAppsCount,
+                delta.allAppsCount,
             )
-            val nameIds  = mutableListOf<Int>()
+            val nameIds = mutableListOf<Int>()
             val nameStrs = mutableListOf<String>()
             var buildIdsPushed = 0
             var staleBuildIdsPinned = 0
             var sourcePackagesPushed = 0
-            for (a in snap.ownedApps) {
+            for (a in delta.ownedApps) {
                 if (a.name.isNotEmpty()) {
                     nameIds.add(a.id)
                     nameStrs.add(a.name)
