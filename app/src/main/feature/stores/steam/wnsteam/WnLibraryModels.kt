@@ -11,6 +11,7 @@ data class WnOwnedPackage(
     val licenseType: Int,
     val changeNumber: Int,
     val accessToken: String,
+    val picsFetched: Boolean = false,
 )
 
 /**
@@ -31,7 +32,33 @@ data class WnOwnedApp(
     val dlcAppIds: List<Int>,
     val sourcePackageIds: List<Int>,
     val buildId: Int = 0,
+    val picsFetched: Boolean = false,
 )
+
+data class WnLibrarySyncProgress(
+    val fetchedPackages: Int = 0,
+    val totalPackages: Int = 0,
+    val fetchedOwnedApps: Int = 0,
+    val totalOwnedApps: Int = 0,
+) {
+    val packageDiscoveryComplete: Boolean
+        get() = totalPackages > 0 && fetchedPackages >= totalPackages
+
+    val fraction: Float
+        get() =
+            when {
+                totalPackages > 0 && !packageDiscoveryComplete ->
+                    fetchedPackages.toFloat() / totalPackages.toFloat()
+                totalOwnedApps > 0 ->
+                    fetchedOwnedApps.toFloat() / totalOwnedApps.toFloat()
+                packageDiscoveryComplete -> 1f
+                else -> 0f
+            }.coerceIn(0f, 1f)
+
+    companion object {
+        val EMPTY = WnLibrarySyncProgress()
+    }
+}
 
 /** Incremental native-library update since a caller-provided revision. */
 data class WnLibraryDelta(

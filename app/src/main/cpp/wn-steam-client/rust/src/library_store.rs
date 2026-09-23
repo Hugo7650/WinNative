@@ -413,6 +413,7 @@ impl WnLibraryStore {
                 "license_type": p.license_type,
                 "change_number": p.change_number,
                 "access_token": p.access_token.to_string(),
+                "pics_fetched": p.pics_fetched,
             })).collect::<Vec<_>>(),
             "owned_apps": owned_apps.iter().map(|a| json!({
                 "id": a.app_id,
@@ -426,6 +427,7 @@ impl WnLibraryStore {
                 "build_id": a.build_id,
                 "dlc": a.dlc_app_ids,
                 "src_packages": a.source_package_ids,
+                "pics_fetched": a.pics_fetched,
             })).collect::<Vec<_>>(),
             "removed_owned_app_ids": removed_owned_app_ids,
             "all_apps_count": all_apps_count,
@@ -448,6 +450,7 @@ impl WnLibraryStore {
                 "license_type": p.license_type,
                 "change_number": p.change_number,
                 "access_token": p.access_token.to_string(),
+                "pics_fetched": p.pics_fetched,
             })).collect::<Vec<_>>(),
             "owned_apps": owned.iter().map(|a| json!({
                 "id": a.app_id,
@@ -461,6 +464,7 @@ impl WnLibraryStore {
                 "build_id": a.build_id,
                 "dlc": a.dlc_app_ids,
                 "src_packages": a.source_package_ids,
+                "pics_fetched": a.pics_fetched,
             })).collect::<Vec<_>>(),
             "all_apps_count": apps.len(),
             "owned_apps_count": owned.len(),

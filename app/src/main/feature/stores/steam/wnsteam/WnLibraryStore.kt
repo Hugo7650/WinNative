@@ -9,8 +9,11 @@ import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableSharedFlow
+import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharedFlow
+import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asSharedFlow
+import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.receiveAsFlow
 import kotlinx.coroutines.launch
 import org.json.JSONArray
@@ -45,6 +48,9 @@ class WnLibraryStore(private val session: WnSteamSession) {
      */
     val updates: Flow<WnLibraryDelta> = updateChannel.receiveAsFlow()
 
+    private val _progress = MutableStateFlow(WnLibrarySyncProgress.EMPTY)
+    val progress: StateFlow<WnLibrarySyncProgress> = _progress.asStateFlow()
+
     private val refreshScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
     private val refreshScheduled = AtomicBoolean(false)
     private val refreshLock = Any()
@@ -55,6 +61,8 @@ class WnLibraryStore(private val session: WnSteamSession) {
     private var lastRevision = 0L
     private var allAppsCount = 0
     private var ownedAppsCount = 0
+    private var fetchedPackages = 0
+    private var fetchedOwnedApps = 0
     private var initialSnapshotEmitted = false
 
     @Volatile
@@ -141,6 +149,9 @@ class WnLibraryStore(private val session: WnSteamSession) {
                 )
                 packagesById.clear()
                 ownedAppsById.clear()
+                fetchedPackages = 0
+                fetchedOwnedApps = 0
+                _progress.value = WnLibrarySyncProgress.EMPTY
                 lastRevision = 0L
                 return
             }
@@ -155,12 +166,31 @@ class WnLibraryStore(private val session: WnSteamSession) {
                 return
             }
 
-            delta.packages.forEach { packagesById[it.id] = it }
-            delta.removedOwnedAppIds.forEach { ownedAppsById.remove(it) }
-            delta.ownedApps.forEach { ownedAppsById[it.id] = it }
+            delta.packages.forEach { pkg ->
+                val previous = packagesById.put(pkg.id, pkg)
+                if (previous?.picsFetched == true) fetchedPackages--
+                if (pkg.picsFetched) fetchedPackages++
+            }
+            delta.removedOwnedAppIds.forEach { appId ->
+                if (ownedAppsById.remove(appId)?.picsFetched == true) fetchedOwnedApps--
+            }
+            delta.ownedApps.forEach { app ->
+                val previous = ownedAppsById.put(app.id, app)
+                if (previous?.picsFetched == true) fetchedOwnedApps--
+                if (app.picsFetched) fetchedOwnedApps++
+            }
             allAppsCount = delta.allAppsCount
             ownedAppsCount = delta.ownedAppsCount
             lastRevision = delta.revision
+            fetchedPackages = fetchedPackages.coerceIn(0, packagesById.size)
+            fetchedOwnedApps = fetchedOwnedApps.coerceIn(0, ownedAppsCount)
+            _progress.value =
+                WnLibrarySyncProgress(
+                    fetchedPackages = fetchedPackages,
+                    totalPackages = packagesById.size,
+                    fetchedOwnedApps = fetchedOwnedApps,
+                    totalOwnedApps = ownedAppsCount,
+                )
 
             if (!updateChannel.trySend(delta).isSuccess) {
                 Timber.tag(TAG).w("failed to enqueue library delta revision=%d", delta.revision)
@@ -225,6 +255,7 @@ class WnLibraryStore(private val session: WnSteamSession) {
                     licenseType = o.optInt("license_type"),
                     changeNumber = o.optInt("change_number"),
                     accessToken = o.optString("access_token", "0"),
+                    picsFetched = o.optBoolean("pics_fetched", false),
                 )
             }
         }
@@ -245,6 +276,7 @@ class WnLibraryStore(private val session: WnSteamSession) {
                     dlcAppIds = o.optJSONArray("dlc").toIntList(),
                     sourcePackageIds = o.optJSONArray("src_packages").toIntList(),
                     buildId = o.optInt("build_id", 0),
+                    picsFetched = o.optBoolean("pics_fetched", false),
                 )
             }
         }
