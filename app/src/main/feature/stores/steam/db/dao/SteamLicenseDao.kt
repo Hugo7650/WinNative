@@ -33,6 +33,9 @@ interface SteamLicenseDao {
     @Query("SELECT * FROM steam_license")
     suspend fun getAllLicenses(): List<SteamLicense>
 
+    @Query("SELECT packageId FROM steam_license")
+    suspend fun getAllPackageIds(): List<Int>
+
     @Query("SELECT * FROM steam_license WHERE packageId = :packageId")
     suspend fun findLicense(packageId: Int): SteamLicense?
 

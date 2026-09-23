@@ -525,13 +525,19 @@ internal fun SteamService.reconnectBackoffMs(attempt: Int): Long {
 
 /** Populate the steam_license / cached_license tables from the received licenses (CMsgClientLicenseList); driven from the post-logon flow. */
 internal suspend fun SteamService.processLicenseList() {
+    val startedNs = System.nanoTime()
+
     // The license list is pushed just after logon; poll briefly for it.
     var json: String? = null
+    var pollAttempts = 0
     for (attempt in 0 until 15) {
+        pollAttempts = attempt + 1
         json = withWnSession { session -> session.getLicenseList() }
         if (json != null && json != "[]") break
         delay(200)
     }
+    val afterPollNs = System.nanoTime()
+
     val arr =
         try {
             JSONArray(json ?: "[]")
@@ -554,6 +560,7 @@ internal suspend fun SteamService.processLicenseList() {
         val territoryCode: Int, val accessToken: Long,
         val ownerId: Int, val masterPackageId: Int,
     )
+
     val raw =
         (0 until arr.length()).map { i ->
             val o = arr.getJSONObject(i)
@@ -575,81 +582,115 @@ internal suspend fun SteamService.processLicenseList() {
             )
         }
 
+    val myAccountId = userSteamId?.accountID?.toInt()
+    val licensesToAdd =
+        raw.groupBy { it.packageId }.map { (packageId, group) ->
+            val preferred =
+                group.firstOrNull { it.ownerId == myAccountId }
+                    ?: group.first()
+            val combinedFlags = EnumSet.noneOf(ELicenseFlags::class.java)
+            group.forEach { combinedFlags.addAll(ELicenseFlags.from(it.flags)) }
+            SteamLicense(
+                packageId = packageId,
+                lastChangeNumber = preferred.changeNumber,
+                timeCreated = Date(preferred.timeCreated * 1000L),
+                timeNextProcess = Date(preferred.timeNextProcess * 1000L),
+                minuteLimit = preferred.minuteLimit,
+                minutesUsed = preferred.minutesUsed,
+                paymentMethod = EPaymentMethod.from(preferred.paymentMethod) ?: EPaymentMethod.None,
+                licenseFlags = combinedFlags,
+                purchaseCode = preferred.purchaseCountryCode,
+                licenseType = ELicenseType.from(preferred.licenseType) ?: ELicenseType.NoLicense,
+                territoryCode = preferred.territoryCode,
+                accessToken = preferred.accessToken,
+                ownerAccountId = group.map { it.ownerId },
+                masterPackageID = preferred.masterPackageId,
+            )
+        }
+    val incomingPackageIds = licensesToAdd.asSequence().map { it.packageId }.toHashSet()
+
+    // Build cached-license payloads before opening the Room transaction so JSON
+    // serialization does not extend the database write lock.
+    val cachedLicenses =
+        raw.map { l ->
+            CachedLicense(
+                licenseJson =
+                    LicenseSerializer.serializeLicenseFields(
+                        packageID = l.packageId,
+                        lastChangeNumber = l.changeNumber,
+                        timeCreatedMs = l.timeCreated * 1000L,
+                        timeNextProcessMs = l.timeNextProcess * 1000L,
+                        minuteLimit = l.minuteLimit,
+                        minutesUsed = l.minutesUsed,
+                        paymentMethod = l.paymentMethod,
+                        flags = l.flags,
+                        purchaseCode = l.purchaseCountryCode,
+                        licenseType = l.licenseType,
+                        territoryCode = l.territoryCode,
+                        accessToken = l.accessToken,
+                        ownerAccountID = l.ownerId,
+                        masterPackageID = l.masterPackageId,
+                    ),
+            )
+        }
+    val afterPrepareNs = System.nanoTime()
+
+    var staleCount = 0
     db.withTransaction {
-        // Every launch refreshes licenses, so findStaleLicences picks up packages we no longer have (e.g. family-share changes).
-
-        // Store raw licenses for the manifest-fetch path (CachedLicense).
         cachedLicenseDao.deleteAll()
-        cachedLicenseDao.insertAll(
-            raw.map { l ->
-                CachedLicense(
-                    licenseJson =
-                        LicenseSerializer.serializeLicenseFields(
-                            packageID = l.packageId,
-                            lastChangeNumber = l.changeNumber,
-                            timeCreatedMs = l.timeCreated * 1000L,
-                            timeNextProcessMs = l.timeNextProcess * 1000L,
-                            minuteLimit = l.minuteLimit,
-                            minutesUsed = l.minutesUsed,
-                            paymentMethod = l.paymentMethod,
-                            flags = l.flags,
-                            purchaseCode = l.purchaseCountryCode,
-                            licenseType = l.licenseType,
-                            territoryCode = l.territoryCode,
-                            accessToken = l.accessToken,
-                            ownerAccountID = l.ownerId,
-                            masterPackageID = l.masterPackageId,
-                        ),
-                )
-            },
-        )
-
-        val myAccountId = userSteamId?.accountID?.toInt()
-        val licensesToAdd =
-            raw.groupBy { it.packageId }.map { (packageId, group) ->
-                val preferred =
-                    group.firstOrNull { it.ownerId == myAccountId }
-                        ?: group.first()
-                // OR-combine the flag bitfields across every owner of the package.
-                val combinedFlags = EnumSet.noneOf(ELicenseFlags::class.java)
-                group.forEach { combinedFlags.addAll(ELicenseFlags.from(it.flags)) }
-                SteamLicense(
-                    packageId = packageId,
-                    lastChangeNumber = preferred.changeNumber,
-                    timeCreated = Date(preferred.timeCreated * 1000L),
-                    timeNextProcess = Date(preferred.timeNextProcess * 1000L),
-                    minuteLimit = preferred.minuteLimit,
-                    minutesUsed = preferred.minutesUsed,
-                    paymentMethod = EPaymentMethod.from(preferred.paymentMethod) ?: EPaymentMethod.None,
-                    licenseFlags = combinedFlags,
-                    purchaseCode = preferred.purchaseCountryCode,
-                    licenseType = ELicenseType.from(preferred.licenseType) ?: ELicenseType.NoLicense,
-                    territoryCode = preferred.territoryCode,
-                    accessToken = preferred.accessToken,
-                    ownerAccountId = group.map { it.ownerId },
-                    masterPackageID = preferred.masterPackageId,
-                )
-            }
+        cachedLicenseDao.insertAll(cachedLicenses)
 
         if (licensesToAdd.isNotEmpty()) {
             Timber.i("Adding ${licensesToAdd.size} licenses")
             licenseDao.insertAll(licensesToAdd)
         }
 
-        val licensesToRemove =
-            licenseDao.findStaleLicences(packageIds = raw.map { it.packageId })
-        if (licensesToRemove.isNotEmpty()) {
-            Timber.i("Removing ${licensesToRemove.size} (stale) licenses")
-            licenseDao.deleteStaleLicenses(licensesToRemove.map { it.packageId })
+        // Do not chunk NOT IN over the full SteamLicense entity: with a 20k
+        // library that repeatedly materialized almost the whole table and
+        // decoded JSON list columns for every 999-id chunk. Read only the PK
+        // column once, then compute the difference in O(N) with a HashSet.
+        val stalePackageIds =
+            licenseDao
+                .getAllPackageIds()
+                .asSequence()
+                .filterNot { it in incomingPackageIds }
+                .toList()
+        staleCount = stalePackageIds.size
+        if (stalePackageIds.isNotEmpty()) {
+            Timber.i("Removing ${stalePackageIds.size} stale licenses")
+            licenseDao.deleteStaleLicenses(stalePackageIds)
         }
-
-        licenseDao
-            .getAllLicenses()
-            .map { PICSRequest(it.packageId, it.accessToken) }
-            .chunked(MAX_PICS_BUFFER)
-            .forEach { chunk ->
-                Timber.d("processLicenseList: Queueing ${chunk.size} package(s) for PICS")
-                packagePicsChannel.send(chunk)
-            }
     }
+    val afterDbNs = System.nanoTime()
+
+    // The freshly parsed license list is already the authoritative source for
+    // packageId/accessToken. Avoid SELECT * + TypeConverter work just to rebuild
+    // the exact same PICS request list, and never hold a Room transaction while
+    // suspending on a channel send.
+    var queuedBatches = 0
+    licensesToAdd
+        .map { PICSRequest(it.packageId, it.accessToken) }
+        .chunked(MAX_PICS_BUFFER)
+        .forEach { chunk ->
+            Timber.d("processLicenseList: Queueing ${chunk.size} package(s) for PICS")
+            packagePicsChannel.send(chunk)
+            queuedBatches++
+        }
+    val finishedNs = System.nanoTime()
+
+    fun elapsedMs(from: Long, to: Long): Long = (to - from) / 1_000_000L
+    Timber.i(
+        "processLicenseList timings: licenses=%d packages=%d stale=%d batches=%d " +
+            "poll=%dms(attempts=%d) prepare=%dms db=%dms enqueue=%dms total=%dms",
+        raw.size,
+        licensesToAdd.size,
+        staleCount,
+        queuedBatches,
+        elapsedMs(startedNs, afterPollNs),
+        pollAttempts,
+        elapsedMs(afterPollNs, afterPrepareNs),
+        elapsedMs(afterPrepareNs, afterDbNs),
+        elapsedMs(afterDbNs, finishedNs),
+        elapsedMs(startedNs, finishedNs),
+    )
 }
