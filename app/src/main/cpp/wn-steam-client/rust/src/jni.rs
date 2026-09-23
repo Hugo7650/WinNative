@@ -1992,6 +1992,27 @@ pub extern "system" fn Java_com_winlator_cmod_feature_stores_steam_wnsteam_WnSte
 }
 
 #[no_mangle]
+pub extern "system" fn Java_com_winlator_cmod_feature_stores_steam_wnsteam_WnSteamSession_nativeGetLibraryDelta(
+    mut env: JNIEnv,
+    _class: JClass,
+    handle: jlong,
+    since_revision: jlong,
+) -> jstring {
+    let Some(handle) = (unsafe { from_session_handle_mut(handle) }) else {
+        return new_string_or_null(&mut env, "{}");
+    };
+    let since_revision = if since_revision < 0 {
+        0
+    } else {
+        since_revision as u64
+    };
+    new_string_or_null(
+        &mut env,
+        &handle.core.library().delta_json(since_revision),
+    )
+}
+
+#[no_mangle]
 pub extern "system" fn Java_com_winlator_cmod_feature_stores_steam_wnsteam_WnSteamSession_nativeStartWineBridge(
     _env: JNIEnv,
     _class: JClass,
@@ -4195,6 +4216,7 @@ pub extern "system" fn Java_com_winlator_cmod_feature_stores_steam_wnsteam_WnSte
     else {
         return ptr::null_mut();
     };
+    handle.core.library().ingest_app_access_tokens(&response);
     let app_tokens = response
         .app_access_tokens
         .iter()
@@ -4255,6 +4277,7 @@ pub extern "system" fn Java_com_winlator_cmod_feature_stores_steam_wnsteam_WnSte
     else {
         return ptr::null_mut();
     };
+    handle.core.library().ingest_app_pics_response(&response);
     let mut apps = Vec::new();
     for app in response.apps {
         if app.buffer.is_empty() {
@@ -4313,6 +4336,7 @@ pub extern "system" fn Java_com_winlator_cmod_feature_stores_steam_wnsteam_WnSte
     ) else {
         return ptr::null_mut();
     };
+    handle.core.library().ingest_package_pics_response(&response);
     let mut packages = Vec::new();
     for package in response.packages {
         if package.buffer.is_empty() {

@@ -34,7 +34,7 @@ interface SteamAppDao {
             // "AND (owner_account_id IN (:ownerIds) OR license_flags & :borrowedCode = :borrowedCode) " +
             "AND package_id != :invalidPkgId " +
             "AND type != 0 " +
-            "ORDER BY LOWER(name)",
+            "ORDER BY name",
     )
     fun getAllOwnedApps(
         // ownerIds: List<Int>,
@@ -48,7 +48,7 @@ interface SteamAppDao {
             "WHERE app.id != 480 " +
             "AND app.package_id != :invalidPkgId " +
             "AND app.type != 0 " +
-            "ORDER BY LOWER(app.name)",
+            "ORDER BY app.name",
     )
     fun getInstalledOwnedApps(
         invalidPkgId: Int = INVALID_PKG_ID,
@@ -57,11 +57,11 @@ interface SteamAppDao {
     @Query(
         "SELECT id, name, type FROM steam_app " +
             "WHERE id != 480 AND package_id != :invalidPkgId AND type != 0 " +
-            "ORDER BY LOWER(name)",
+            "ORDER BY name",
     )
-    fun getOwnedAppSummaries(
+    suspend fun getOwnedAppSummaries(
         invalidPkgId: Int = INVALID_PKG_ID,
-    ): Flow<List<SteamAppSummary>>
+    ): List<SteamAppSummary>
 
     @Query("SELECT * FROM steam_app WHERE received_pics = 0 AND package_id != :invalidPkgId AND owner_account_id = :ownerId")
     fun getAllOwnedAppsWithoutPICS(

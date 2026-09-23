@@ -623,6 +623,12 @@ class WnSteamSession : AutoCloseable {
         return nativeGetLibrarySnapshot(h)
     }
 
+    // Incremental library JSON containing only entities changed after [sinceRevision].
+    fun getLibraryDeltaJson(sinceRevision: Long): String {
+        val h = nativeHandle.get(); if (h == 0L) return "{}"
+        return nativeGetLibraryDelta(h, sinceRevision)
+    }
+
     // Install or clear the native library-store observer.
     fun setLibraryObserver(observer: WnLibraryObserver?) {
         val h = nativeHandle.get(); if (h == 0L) return
@@ -779,6 +785,7 @@ class WnSteamSession : AutoCloseable {
         @JvmStatic private external fun nativeSignalAppLaunchIntent(handle: Long, appId: Int, clientId: Long, machineName: String, ignorePending: Boolean, osType: Int): String?
         @JvmStatic private external fun nativeSignalAppExitSyncDone(handle: Long, appId: Int, clientId: Long, uploadsCompleted: Boolean, uploadsRequired: Boolean)
         @JvmStatic private external fun nativeGetLibrarySnapshot(handle: Long): String
+        @JvmStatic private external fun nativeGetLibraryDelta(handle: Long, sinceRevision: Long): String
         @JvmStatic private external fun nativeSetLibraryObserver(
             handle: Long,
             observer: WnLibraryObserver?,

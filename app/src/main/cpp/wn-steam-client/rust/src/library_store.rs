@@ -40,14 +40,33 @@ pub struct OwnedApp {
 type SnapshotObserver = Arc<dyn Fn() + Send + Sync + 'static>;
 
 #[derive(Default)]
+struct LibraryRevisionChange {
+    package_ids: Vec<u32>,
+    app_ids: Vec<u32>,
+}
+
+#[derive(Default)]
+struct LibraryRevisionState {
+    revision: u64,
+    changes: Vec<LibraryRevisionChange>,
+    owned_apps_count: usize,
+}
+
+#[derive(Default)]
 pub struct WnLibraryStore {
     packages: Mutex<HashMap<u32, OwnedPackage>>,
     apps: Mutex<HashMap<u32, OwnedApp>>,
+    revisions: Mutex<LibraryRevisionState>,
     observer: Mutex<Option<SnapshotObserver>>,
 }
 
 impl WnLibraryStore {
     pub fn ingest_license_list(&self, msg: &CMsgClientLicenseList) {
+        let changed_packages = msg
+            .licenses
+            .iter()
+            .map(|license| license.package_id)
+            .collect::<Vec<_>>();
         {
             let mut packages = self.packages.lock().expect("library packages poisoned");
             for license in &msg.licenses {
@@ -63,7 +82,10 @@ impl WnLibraryStore {
                 slot.license_type = license.license_type;
             }
         }
-        self.notify();
+        if !changed_packages.is_empty() {
+            self.mark_changed(&changed_packages, &[], 0);
+            self.notify();
+        }
     }
 
     pub fn get_pending_package_pics_request(&self, max_count: usize) -> Vec<PicsPackageInfoReq> {
@@ -101,10 +123,14 @@ impl WnLibraryStore {
     }
 
     pub fn ingest_package_pics_response(&self, resp: &CMsgClientPICSProductInfoResponse) {
+        let mut changed_packages = Vec::new();
+        let mut changed_apps = Vec::new();
+        let mut newly_owned_apps = 0usize;
         {
             let mut packages = self.packages.lock().expect("library packages poisoned");
             let mut apps = self.apps.lock().expect("library apps poisoned");
             for package in &resp.packages {
+                changed_packages.push(package.packageid);
                 let slot = packages.entry(package.packageid).or_default();
                 slot.package_id = package.packageid;
                 slot.change_number = package.change_number as i32;
@@ -114,9 +140,13 @@ impl WnLibraryStore {
                         extract_uint32_array(root.child("appids"), &mut slot.app_ids);
                         extract_uint32_array(root.child("depotids"), &mut slot.depot_ids);
                         for app_id in &slot.app_ids {
+                            changed_apps.push(*app_id);
                             let app = apps.entry(*app_id).or_default();
                             app.app_id = *app_id;
                             if !app.source_package_ids.contains(&package.packageid) {
+                                if app.source_package_ids.is_empty() {
+                                    newly_owned_apps += 1;
+                                }
                                 app.source_package_ids.push(package.packageid);
                             }
                         }
@@ -126,16 +156,22 @@ impl WnLibraryStore {
             for package_id in &resp.unknown_packageids {
                 if let Some(package) = packages.get_mut(package_id) {
                     package.pics_fetched = true;
+                    changed_packages.push(*package_id);
                 }
             }
         }
-        self.notify();
+        if !changed_packages.is_empty() || !changed_apps.is_empty() {
+            self.mark_changed(&changed_packages, &changed_apps, newly_owned_apps);
+            self.notify();
+        }
     }
 
     pub fn ingest_app_pics_response(&self, resp: &CMsgClientPICSProductInfoResponse) {
+        let mut changed_apps = Vec::new();
         {
             let mut apps = self.apps.lock().expect("library apps poisoned");
             for app_resp in &resp.apps {
+                changed_apps.push(app_resp.appid);
                 let app = apps.entry(app_resp.appid).or_default();
                 app.app_id = app_resp.appid;
                 app.change_number = app_resp.change_number;
@@ -184,6 +220,7 @@ impl WnLibraryStore {
                 let child_id = app.app_id;
                 let parent_id = app.parent_app_id;
                 if parent_id != 0 {
+                    changed_apps.push(parent_id);
                     let parent = apps.entry(parent_id).or_default();
                     parent.app_id = parent_id;
                     if !parent.dlc_app_ids.contains(&child_id) {
@@ -194,16 +231,22 @@ impl WnLibraryStore {
             for app_id in &resp.unknown_appids {
                 if let Some(app) = apps.get_mut(app_id) {
                     app.pics_fetched = true;
+                    changed_apps.push(*app_id);
                 }
             }
         }
-        self.notify();
+        if !changed_apps.is_empty() {
+            self.mark_changed(&[], &changed_apps, 0);
+            self.notify();
+        }
     }
 
     pub fn ingest_app_access_tokens(&self, resp: &CMsgClientPICSAccessTokenResponse) {
+        let mut changed_apps = Vec::new();
         {
             let mut apps = self.apps.lock().expect("library apps poisoned");
             for token in &resp.app_access_tokens {
+                changed_apps.push(token.appid);
                 let app = apps.entry(token.appid).or_default();
                 app.app_id = token.appid;
                 app.access_token = token.access_token;
@@ -213,10 +256,14 @@ impl WnLibraryStore {
                 if let Some(app) = apps.get_mut(app_id) {
                     app.pics_fetched = true;
                     app.missing_token = false;
+                    changed_apps.push(*app_id);
                 }
             }
         }
-        self.notify();
+        if !changed_apps.is_empty() {
+            self.mark_changed(&[], &changed_apps, 0);
+            self.notify();
+        }
     }
 
     pub fn packages(&self) -> Vec<OwnedPackage> {
@@ -264,12 +311,129 @@ impl WnLibraryStore {
     }
 
     pub fn owned_app_count(&self) -> usize {
-        self.apps
+        self.revisions
             .lock()
-            .expect("library apps poisoned")
-            .values()
-            .filter(|app| !app.source_package_ids.is_empty())
-            .count()
+            .expect("library revisions poisoned")
+            .owned_apps_count
+    }
+
+    fn mark_changed(
+        &self,
+        package_ids: &[u32],
+        app_ids: &[u32],
+        newly_owned_apps: usize,
+    ) {
+        if package_ids.is_empty() && app_ids.is_empty() {
+            return;
+        }
+        let mut state = self.revisions.lock().expect("library revisions poisoned");
+        state.revision = state.revision.saturating_add(1);
+        state.owned_apps_count = state.owned_apps_count.saturating_add(newly_owned_apps);
+        state.changes.push(LibraryRevisionChange {
+            package_ids: package_ids.to_vec(),
+            app_ids: app_ids.to_vec(),
+        });
+    }
+
+    pub fn delta_json(&self, since_revision: u64) -> String {
+        let (revision, mut package_ids, mut app_ids, owned_apps_count) = {
+            let state = self.revisions.lock().expect("library revisions poisoned");
+            let start = usize::try_from(since_revision)
+                .unwrap_or(usize::MAX)
+                .min(state.changes.len());
+            let mut package_ids = Vec::new();
+            let mut app_ids = Vec::new();
+            for change in &state.changes[start..] {
+                package_ids.extend_from_slice(&change.package_ids);
+                app_ids.extend_from_slice(&change.app_ids);
+            }
+            (
+                state.revision,
+                package_ids,
+                app_ids,
+                state.owned_apps_count,
+            )
+        };
+
+        // A revision of zero means the caller has no baseline. Include all current
+        // entries even if they predate revision tracking, preserving a full initial sync.
+        if since_revision == 0 {
+            package_ids = self
+                .packages
+                .lock()
+                .expect("library packages poisoned")
+                .keys()
+                .copied()
+                .collect();
+            app_ids = self
+                .apps
+                .lock()
+                .expect("library apps poisoned")
+                .keys()
+                .copied()
+                .collect();
+        }
+        package_ids.sort_unstable();
+        package_ids.dedup();
+        app_ids.sort_unstable();
+        app_ids.dedup();
+
+        let packages = {
+            let packages = self.packages.lock().expect("library packages poisoned");
+            package_ids
+                .iter()
+                .filter_map(|id| packages.get(id).cloned())
+                .collect::<Vec<_>>()
+        };
+        let (owned_apps, removed_owned_app_ids, all_apps_count) = {
+            let apps = self.apps.lock().expect("library apps poisoned");
+            let owned_apps = app_ids
+                .iter()
+                .filter_map(|id| apps.get(id))
+                .filter(|app| !app.source_package_ids.is_empty())
+                .cloned()
+                .collect::<Vec<_>>();
+            let removed_owned_app_ids = app_ids
+                .iter()
+                .filter(|id| {
+                    apps.get(*id)
+                        .map(|app| app.source_package_ids.is_empty())
+                        .unwrap_or(true)
+                })
+                .copied()
+                .collect::<Vec<_>>();
+            (owned_apps, removed_owned_app_ids, apps.len())
+        };
+
+        json!({
+            "revision": revision,
+            "packages": packages.iter().map(|p| json!({
+                "id": p.package_id,
+                "flags": p.license_flags,
+                "license_type": p.license_type,
+                "change_number": p.change_number,
+                "access_token": p.access_token.to_string(),
+                "pics_fetched": p.pics_fetched,
+            })).collect::<Vec<_>>(),
+            "owned_apps": owned_apps.iter().map(|a| json!({
+                "id": a.app_id,
+                "change_number": a.change_number,
+                "name": a.name,
+                "type": a.app_type,
+                "sort_as": a.sort_as,
+                "os_list": a.os_list,
+                "parent": a.parent_app_id,
+                "access_token": a.access_token.to_string(),
+                "build_id": a.build_id,
+                "dlc": a.dlc_app_ids,
+                "src_packages": a.source_package_ids,
+                "pics_fetched": a.pics_fetched,
+            })).collect::<Vec<_>>(),
+            "removed_owned_app_ids": removed_owned_app_ids,
+            "all_apps_count": all_apps_count,
+            "owned_apps_count": owned_apps_count,
+        })
+        .to_string()
     }
 
     pub fn snapshot_json(&self) -> String {
@@ -286,6 +450,7 @@ impl WnLibraryStore {
                 "license_type": p.license_type,
                 "change_number": p.change_number,
                 "access_token": p.access_token.to_string(),
+                "pics_fetched": p.pics_fetched,
             })).collect::<Vec<_>>(),
             "owned_apps": owned.iter().map(|a| json!({
                 "id": a.app_id,
@@ -299,6 +464,7 @@ impl WnLibraryStore {
                 "build_id": a.build_id,
                 "dlc": a.dlc_app_ids,
                 "src_packages": a.source_package_ids,
+                "pics_fetched": a.pics_fetched,
             })).collect::<Vec<_>>(),
             "all_apps_count": apps.len(),
             "owned_apps_count": owned.len(),
@@ -396,6 +562,39 @@ mod tests {
         assert_eq!(app.parent_app_id, 480);
         assert_eq!(app.build_id, 99);
         assert!(store.find_app(480).unwrap().dlc_app_ids.contains(&481));
+    }
+
+    #[test]
+    fn delta_only_returns_entities_changed_after_revision() {
+        let store = WnLibraryStore::default();
+        store.ingest_license_list(&CMsgClientLicenseList {
+            eresult: 1,
+            licenses: vec![License {
+                package_id: 100,
+                access_token: 55,
+                change_number: 7,
+                ..Default::default()
+            }],
+        });
+        let first: serde_json::Value = serde_json::from_str(&store.delta_json(0)).unwrap();
+        let revision = first["revision"].as_u64().unwrap();
+        assert_eq!(first["packages"].as_array().unwrap().len(), 1);
+
+        let unchanged: serde_json::Value =
+            serde_json::from_str(&store.delta_json(revision)).unwrap();
+        assert!(unchanged["packages"].as_array().unwrap().is_empty());
+        assert!(unchanged["owned_apps"].as_array().unwrap().is_empty());
+
+        store.ingest_app_access_tokens(&CMsgClientPICSAccessTokenResponse {
+            app_access_tokens: vec![crate::pb::cmsg_client_pics::PicsAppToken {
+                appid: 480,
+                access_token: 99,
+            }],
+            ..Default::default()
+        });
+        let changed: serde_json::Value =
+            serde_json::from_str(&store.delta_json(revision)).unwrap();
+        assert_eq!(changed["removed_owned_app_ids"][0].as_u64(), Some(480));
     }
 
     #[test]

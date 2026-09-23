@@ -207,6 +207,7 @@ import com.winlator.cmod.feature.stores.steam.enums.DownloadPhase
 import com.winlator.cmod.feature.stores.steam.events.AndroidEvent
 import com.winlator.cmod.feature.stores.steam.events.EventDispatcher
 import com.winlator.cmod.feature.stores.steam.service.SteamService
+import com.winlator.cmod.feature.stores.steam.wnsteam.WnLibrarySyncProgress
 import com.winlator.cmod.feature.stores.steam.utils.PrefManager
 import com.winlator.cmod.feature.stores.steam.utils.getAvatarURL
 import com.winlator.cmod.feature.sync.CloudSyncHelper
@@ -260,6 +261,7 @@ import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.flow.conflate
 import kotlinx.coroutines.withContext
 import javax.inject.Inject
 import kotlin.math.abs
@@ -270,6 +272,7 @@ import kotlin.math.roundToInt
 private val StoreTabKeys = setOf("steam", "epic", "gog", "itch")
 private val HeaderCollapseTriggerDistance = 24.dp
 private const val HeaderRevealFraction = 0.5f
+private const val STEAM_CATALOG_INVALIDATION_COALESCE_MS = 1_000L
 private val TabLabelAutoSize =
     TextAutoSize.StepBased(minFontSize = 8.sp, maxFontSize = 13.sp, stepSize = 0.5.sp)
 
@@ -320,6 +323,7 @@ internal fun UnifiedActivity.UnifiedHub() {
     var showAddCustomGame by remember { mutableStateOf(false) }
     var showExitDialog by remember { mutableStateOf(false) }
     var searchQueryTfv by remember { mutableStateOf(TextFieldValue("")) }
+    var isSearchExpanded by remember { mutableStateOf(false) }
     val searchQuery = searchQueryTfv.text
     var localLibraryRefreshKey by remember { mutableIntStateOf(0) }
     var shortcutDataRefreshKey by remember { mutableIntStateOf(0) }
@@ -349,23 +353,47 @@ internal fun UnifiedActivity.UnifiedHub() {
         if (!drawerState.isOpen) drawerNavBridge.controllerActive = false
     }
     val isLoggedIn by SteamService.isLoggedInFlow.collectAsState()
+    val steamLibrarySyncProgress by SteamService.librarySyncProgress.collectAsState()
     val chatServiceEnabled by SteamService.chatServiceEnabledFlow.collectAsState()
     val isEpicLoggedIn by EpicAuthManager.isLoggedInFlow.collectAsState()
     val isGogLoggedIn by GOGAuthManager.isLoggedInFlow.collectAsState()
-    val installedSteamApps by
-        db.steamAppDao().getInstalledOwnedApps().collectAsState(initial = emptyList())
-    val steamOwnedAppSummaries by
-        db.steamAppDao().getOwnedAppSummaries().collectAsState(initial = emptyList())
-    val shouldLoadSteamCatalog = tabs.getOrNull(selectedIdx)?.key == "steam"
-    val steamCatalogFlow =
-        remember(shouldLoadSteamCatalog) {
-            if (shouldLoadSteamCatalog) {
-                db.steamAppDao().getAllOwnedApps()
+    val selectedTabKey = tabs.getOrNull(selectedIdx)?.key ?: "library"
+    val shouldLoadLibraryData = selectedTabKey == "library"
+    val installedSteamFlow =
+        remember(shouldLoadLibraryData) {
+            if (shouldLoadLibraryData) {
+                db.steamAppDao().getInstalledOwnedApps()
             } else {
                 kotlinx.coroutines.flow.flowOf(emptyList<SteamApp>())
             }
         }
-    val steamApps by steamCatalogFlow.collectAsState(initial = emptyList())
+    val installedSteamApps by installedSteamFlow.collectAsState(initial = emptyList())
+
+    // PICS can update steam_app dozens of times during a large initial sync. Observe
+    // invalidations cheaply, coalesce bursts, then read only the lightweight store
+    // projection instead of re-materializing every heavy SteamApp row per batch.
+    val shouldLoadSteamCatalog = selectedTabKey == "library" || selectedTabKey == "steam"
+    val steamCatalogFlow =
+        remember(shouldLoadSteamCatalog) {
+            if (!shouldLoadSteamCatalog) {
+                kotlinx.coroutines.flow.flowOf(emptyList<SteamAppSummary>())
+            } else {
+                kotlinx.coroutines.flow.flow {
+                    var firstInvalidation = true
+                    db.invalidationTracker
+                        .createFlow("steam_app", emitInitialState = true)
+                        .conflate()
+                        .collect {
+                            if (!firstInvalidation) {
+                                kotlinx.coroutines.delay(STEAM_CATALOG_INVALIDATION_COALESCE_MS)
+                            }
+                            emit(db.steamAppDao().getOwnedAppSummaries())
+                            firstInvalidation = false
+                        }
+                }
+            }
+        }
+    val steamOwnedAppSummaries by steamCatalogFlow.collectAsState(initial = emptyList())
     val context = LocalContext.current
     val persona by SteamService.instance?.localPersona?.collectAsState()
         ?: remember { mutableStateOf(null) }
@@ -419,7 +447,7 @@ internal fun UnifiedActivity.UnifiedHub() {
     val isControllerConnected = controllerState.isConnected
     val isPS = controllerState.isPlayStation
     val isLibraryTab = tabs.getOrNull(selectedIdx)?.key == "library"
-    val steamSelectionApps = if (isLibraryTab) installedSteamApps else steamApps
+    val steamSelectionApps = installedSteamApps
 
     val libraryRefreshListener =
         remember {
@@ -531,10 +559,6 @@ internal fun UnifiedActivity.UnifiedHub() {
         }
 
     val contentFilterSnapshot = contentFilters.toMap()
-    val filteredSteamApps =
-        remember(steamApps, contentFilterSnapshot) {
-            steamApps.filter { app -> isSteamContentTypeVisible(app.type, contentFilterSnapshot) }
-        }
     val filteredInstalledSteamApps =
         remember(installedSteamApps, contentFilterSnapshot) {
             installedSteamApps.filter { app ->
@@ -968,6 +992,8 @@ internal fun UnifiedActivity.UnifiedHub() {
                     }, persona, context, scope, isControllerConnected, isPS, isLibraryTab, searchQueryTfv, {
                         searchQueryTfv =
                             it
+                    }, isSearchExpanded, {
+                        isSearchExpanded = it
                     }, onFilterClicked = { scope.launch { drawerState.open() } }, onFriendsClicked = { scope.launch { rightDrawerState.open() } }) {
                         if (selectedLibrarySource == "GOG") {
                             globalSettingsGogGame = gogApps.find { it.id == selectedGogGameId }
@@ -1029,20 +1055,15 @@ internal fun UnifiedActivity.UnifiedHub() {
 
                     LaunchedEffect(key) { libraryTabActive.value = (key == "library") }
 
-                    // Keep Library composed so its state survives tab switches.
-                    Box(
-                        Modifier.fillMaxSize().let {
-                            if (key == "library") {
-                                it
-                            } else {
-                                it.alpha(0f).pointerInput(Unit) { /* block ghost taps */ }
-                            }
-                        },
-                    ) {
+                    if (key == "library") {
+                        // Do not keep the Library subtree alive behind other tabs. Its
+                        // file scans, artwork work and Steam install validation are all
+                        // tied to composition and should stop when the user leaves it.
                         LibraryCarousel(
                             isLoggedIn = isLoggedIn,
                             steamApps = filteredInstalledSteamApps,
                             steamOwnedApps = filteredSteamOwnedAppSummaries,
+                            steamSyncProgress = steamLibrarySyncProgress,
                             epicApps = epicApps,
                             gogApps = gogApps,
                             layoutMode = libraryLayoutMode,
@@ -1053,9 +1074,7 @@ internal fun UnifiedActivity.UnifiedHub() {
                             searchQuery = searchQuery,
                             isControllerConnected = isControllerConnected,
                         )
-                    }
-
-                    if (key != "library") {
+                    } else {
                         AnimatedContent(
                             targetState = key,
                             transitionSpec = {
@@ -1073,7 +1092,14 @@ internal fun UnifiedActivity.UnifiedHub() {
                                 }
 
                                 "steam" -> {
-                                    SteamStoreTab(isLoggedIn, filteredSteamApps, searchQuery, LibraryLayoutMode.GRID_4)
+                                    SteamStoreTab(
+                                        isLoggedIn,
+                                        filteredSteamOwnedAppSummaries,
+                                        steamLibrarySyncProgress,
+                                        searchQuery,
+                                        isSearchExpanded,
+                                        LibraryLayoutMode.GRID_4,
+                                    )
                                 }
 
                                 "epic" -> {
@@ -1525,11 +1551,12 @@ internal fun UnifiedActivity.TopBar(
     isLibraryTab: Boolean,
     searchQuery: TextFieldValue,
     onSearchQueryChange: (TextFieldValue) -> Unit,
+    isSearchExpanded: Boolean,
+    onSearchExpandedChange: (Boolean) -> Unit,
     onFilterClicked: () -> Unit,
     onFriendsClicked: () -> Unit = {},
     onGameSettingsClicked: () -> Unit,
 ) {
-    var isSearchExpanded by remember { mutableStateOf(false) }
     val searchFocusRequester = remember { FocusRequester() }
     val keyboardController = LocalSoftwareKeyboardController.current
     val isDownloadsTab = tabs.getOrNull(selectedIdx)?.key == "downloads"
@@ -1539,7 +1566,7 @@ internal fun UnifiedActivity.TopBar(
     LaunchedEffect(selectedIdx) {
         if (isSearchExpanded) {
             onSearchQueryChange(TextFieldValue(""))
-            isSearchExpanded = false
+            onSearchExpandedChange(false)
         }
     }
 
@@ -1559,9 +1586,9 @@ internal fun UnifiedActivity.TopBar(
             if (!isDownloadsTab) {
                 if (isSearchExpanded) {
                     onSearchQueryChange(TextFieldValue(""))
-                    isSearchExpanded = false
+                    onSearchExpandedChange(false)
                 } else {
-                    isSearchExpanded = true
+                    onSearchExpandedChange(true)
                 }
             }
         }
@@ -1768,9 +1795,9 @@ internal fun UnifiedActivity.TopBar(
                                 if (!isDownloadsTab) {
                                     if (isSearchExpanded) {
                                         onSearchQueryChange(TextFieldValue(""))
-                                        isSearchExpanded = false
+                                        onSearchExpandedChange(false)
                                     } else {
-                                        isSearchExpanded = true
+                                        onSearchExpandedChange(true)
                                     }
                                 }
                             },
@@ -2071,6 +2098,7 @@ internal fun UnifiedActivity.LibraryCarousel(
     isLoggedIn: Boolean,
     steamApps: List<SteamApp>,
     steamOwnedApps: List<SteamAppSummary>,
+    steamSyncProgress: WnLibrarySyncProgress,
     epicApps: List<EpicGame>,
     gogApps: List<GOGGame>,
     layoutMode: LibraryLayoutMode,
@@ -2642,9 +2670,17 @@ internal fun UnifiedActivity.LibraryCarousel(
     // "No games installed". This resolves itself once the store populates its
     // DB (steamApps/epicApps/gogApps become non-empty) or if other sources
     // (custom apps, other stores) already have installed games.
+    val steamSyncIncomplete =
+        isLoggedIn &&
+            (
+                steamOwnedApps.isEmpty() ||
+                    (steamSyncProgress.totalPackages > 0 && !steamSyncProgress.packageDiscoveryComplete) ||
+                    (steamSyncProgress.totalOwnedApps > 0 &&
+                        steamSyncProgress.fetchedOwnedApps < steamSyncProgress.totalOwnedApps)
+            )
     val awaitingStoreSync =
         installedApps.isEmpty() && (
-            (isLoggedIn && steamOwnedApps.isEmpty()) ||
+            steamSyncIncomplete ||
                 (epicApps.isEmpty() && EpicService.hasStoredCredentials(context)) ||
                 (gogApps.isEmpty() && GOGAuthManager.isLoggedIn(context))
         )
@@ -2662,11 +2698,70 @@ internal fun UnifiedActivity.LibraryCarousel(
                 animationSpec = tween(durationMillis = 600),
                 label = "loaderFade",
             )
-            CircularProgressIndicator(
-                color = Accent,
-                strokeWidth = 3.dp,
-                modifier = Modifier.size(48.dp).alpha(spinAlpha),
-            )
+            Column(
+                horizontalAlignment = Alignment.CenterHorizontally,
+                verticalArrangement = Arrangement.Center,
+            ) {
+                CircularProgressIndicator(
+                    color = Accent,
+                    strokeWidth = 3.dp,
+                    modifier = Modifier.size(48.dp).alpha(spinAlpha),
+                )
+
+                val packageStage =
+                    isLoggedIn &&
+                        steamSyncProgress.totalPackages > 0 &&
+                        !steamSyncProgress.packageDiscoveryComplete
+                val progressTotal =
+                    if (packageStage) {
+                        steamSyncProgress.totalPackages
+                    } else {
+                        steamSyncProgress.totalOwnedApps
+                    }
+                val progressLoaded =
+                    if (packageStage) {
+                        steamSyncProgress.fetchedPackages
+                    } else {
+                        steamSyncProgress.fetchedOwnedApps
+                    }
+                if (isLoggedIn && progressTotal > 0) {
+                    val fraction = steamSyncProgress.fraction
+                    val percent = (fraction * 100f).toInt().coerceIn(0, 100)
+                    Spacer(Modifier.height(16.dp))
+                    Text(
+                        text =
+                            if (packageStage) {
+                                "Discovering Steam library · $percent%"
+                            } else {
+                                "Loading Steam metadata · $percent%"
+                            },
+                        color = TextPrimary,
+                        fontSize = 14.sp,
+                        fontWeight = FontWeight.SemiBold,
+                    )
+                    Spacer(Modifier.height(8.dp))
+                    Box(
+                        Modifier
+                            .width(240.dp)
+                            .height(6.dp)
+                            .clip(RoundedCornerShape(999.dp))
+                            .background(MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.55f)),
+                    ) {
+                        Box(
+                            Modifier
+                                .fillMaxHeight()
+                                .fillMaxWidth(fraction)
+                                .background(Accent),
+                        )
+                    }
+                    Spacer(Modifier.height(7.dp))
+                    Text(
+                        text = "$progressLoaded / $progressTotal",
+                        color = TextSecondary,
+                        fontSize = 12.sp,
+                    )
+                }
+            }
         }
         return
     }

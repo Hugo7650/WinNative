@@ -189,10 +189,12 @@ import com.winlator.cmod.feature.stores.steam.SteamLoginActivity
 import com.winlator.cmod.feature.stores.steam.data.DepotInfo
 import com.winlator.cmod.feature.stores.steam.data.DownloadInfo
 import com.winlator.cmod.feature.stores.steam.data.SteamApp
+import com.winlator.cmod.feature.stores.steam.db.dao.SteamAppSummary
 import com.winlator.cmod.feature.stores.steam.enums.DownloadPhase
 import com.winlator.cmod.feature.stores.steam.events.AndroidEvent
 import com.winlator.cmod.feature.stores.steam.events.EventDispatcher
 import com.winlator.cmod.feature.stores.steam.service.SteamService
+import com.winlator.cmod.feature.stores.steam.wnsteam.WnLibrarySyncProgress
 import com.winlator.cmod.feature.stores.steam.utils.PrefManager
 import com.winlator.cmod.feature.stores.steam.utils.getAvatarURL
 import com.winlator.cmod.feature.sync.CloudSyncHelper
@@ -2003,8 +2005,10 @@ internal fun UnifiedActivity.GOGGameManagerDialog(
 @Composable
 internal fun UnifiedActivity.SteamStoreTab(
     isLoggedIn: Boolean,
-    steamApps: List<SteamApp>,
+    steamApps: List<SteamAppSummary>,
+    syncProgress: WnLibrarySyncProgress,
     searchQuery: String = "",
+    isSearchExpanded: Boolean = false,
     layoutMode: LibraryLayoutMode = LibraryLayoutMode.GRID_4,
 ) {
     if (!isLoggedIn && !SteamService.hasStoredCredentials(this)) {
@@ -2017,6 +2021,17 @@ internal fun UnifiedActivity.SteamStoreTab(
     var selectedAppForDialog by remember { mutableStateOf<SteamApp?>(null) }
     val gridState = rememberLazyGridState()
     val activity = LocalContext.current as? UnifiedActivity
+    val scope = rememberCoroutineScope()
+    val steamAppDao = remember { PluviaDatabase.getInstance(this@SteamStoreTab).steamAppDao() }
+
+    fun openApp(app: SteamAppSummary) {
+        scope.launch {
+            selectedAppForDialog =
+                withContext(Dispatchers.IO) {
+                    steamAppDao.findApp(app.id)
+                }
+        }
+    }
 
     val displayedApps =
         remember(steamApps, searchQuery) {
@@ -2026,7 +2041,25 @@ internal fun UnifiedActivity.SteamStoreTab(
                 steamApps.filter { it.name.contains(searchQuery, ignoreCase = true) }
             }
         }
-    val installStateById = rememberSteamInstallStateMap(displayedApps)
+    val displayedAppIds = remember(displayedApps) { displayedApps.map { it.id } }
+    val installStateById = rememberSteamInstallStateMap(displayedAppIds)
+
+    val packageStage =
+        isLoggedIn &&
+            syncProgress.totalPackages > 0 &&
+            !syncProgress.packageDiscoveryComplete
+    val metadataStage =
+        isLoggedIn &&
+            syncProgress.packageDiscoveryComplete &&
+            syncProgress.totalOwnedApps > 0 &&
+            syncProgress.fetchedOwnedApps < syncProgress.totalOwnedApps
+    val showSyncProgress = packageStage || metadataStage
+    val syncLoaded =
+        if (packageStage) syncProgress.fetchedPackages else syncProgress.fetchedOwnedApps
+    val syncTotal =
+        if (packageStage) syncProgress.totalPackages else syncProgress.totalOwnedApps
+    val syncFraction = syncProgress.fraction
+    val syncPercent = (syncFraction * 100f).toInt().coerceIn(0, 100)
 
     // Sync store focus infrastructure
     LaunchedEffect(displayedApps.size) {
@@ -2039,7 +2072,7 @@ internal fun UnifiedActivity.SteamStoreTab(
     // Register A-button click callback and grid state for visible-area snapping
     DisposableEffect(displayedApps) {
         val clickCallback: (Int) -> Unit = { idx ->
-            displayedApps.getOrNull(idx)?.let { selectedAppForDialog = it }
+            displayedApps.getOrNull(idx)?.let(::openApp)
         }
         activity?.storeItemClickCallback = clickCallback
         activity?.storeGridState = gridState
@@ -2051,73 +2084,167 @@ internal fun UnifiedActivity.SteamStoreTab(
         }
     }
 
-    if (layoutMode == LibraryLayoutMode.LIST) {
-        val listViewState = rememberLazyListState()
-        JoystickListScroll(listViewState, activity?.rightStickScrollState, minSpeed = 2.5f, maxSpeed = 16f, quadratic = true)
-        ListView(
-            items = displayedApps,
-            modifier = Modifier.tabScreenPadding(),
-            listState = listViewState,
-            contentPadding = TabListContentPadding,
-            keyOf = { it.id },
-        ) { app, _, _ ->
-            SteamStoreCapsule(
-                app,
-                isInstalled = installStateById[app.id] == true,
-                listMode = true,
-                isControllerActive = ControllerHelper.isControllerConnected(),
-                onClick = {
-                    selectedAppForDialog =
-                        app
-                },
-            )
-        }
-    } else {
-        val focusIndex by (activity?.storeFocusIndex ?: kotlinx.coroutines.flow.MutableStateFlow(0)).collectAsState()
-        val focusRequesters =
-            remember(displayedApps.size) {
-                List(displayedApps.size) { FocusRequester() }
-            }
-        LaunchedEffect(focusIndex, focusRequesters.size) {
-            if (searchQuery.isEmpty() && focusRequesters.isNotEmpty() && focusIndex in focusRequesters.indices) {
-                gridState.animateScrollToItem(focusIndex)
-                try {
-                    focusRequesters[focusIndex].requestFocus()
-                } catch (_: Exception) {
-                }
-            }
-        }
-        // Right joystick: 2x faster at full push with quadratic speed curve
-        JoystickGridScroll(gridState, activity?.rightStickScrollState, minSpeed = 2.5f, maxSpeed = 16f, quadratic = true)
-        // Left joystick: 75% slower scrolling (vertical only, for browsing store)
-        JoystickGridScroll(gridState, activity?.leftStickScrollState, deadZone = 0.15f, minSpeed = 0.3125f, maxSpeed = 2f)
-        FourByTwoGridView(
-            items = displayedApps,
-            modifier = Modifier.tabScreenPadding(top = TabGridTopPadding),
-            gridState = gridState,
-            keyOf = { it.id },
-        ) { app, index, rowHeight ->
-            Box(
-                Modifier.height(rowHeight).then(
-                    if (index in focusRequesters.indices) {
-                        Modifier.focusRequester(focusRequesters[index])
-                    } else {
-                        Modifier
-                    },
-                ),
-            ) {
+    Box(Modifier.fillMaxSize()) {
+        if (layoutMode == LibraryLayoutMode.LIST) {
+            val listViewState = rememberLazyListState()
+            JoystickListScroll(listViewState, activity?.rightStickScrollState, minSpeed = 2.5f, maxSpeed = 16f, quadratic = true)
+            ListView(
+                items = displayedApps,
+                modifier = Modifier.tabScreenPadding(),
+                listState = listViewState,
+                contentPadding = TabListContentPadding,
+                keyOf = { it.id },
+            ) { app, _, _ ->
                 SteamStoreCapsule(
                     app,
                     isInstalled = installStateById[app.id] == true,
-                    isFocusedOverride = index == focusIndex,
-                    isControllerActive =
-                        ControllerHelper
-                            .isControllerConnected(),
-                    onClick = {
-                        selectedAppForDialog =
-                            app
-                    },
+                    listMode = true,
+                    isControllerActive = ControllerHelper.isControllerConnected(),
+                    onClick = { openApp(app) },
                 )
+            }
+        } else {
+            val focusIndex by (activity?.storeFocusIndex ?: kotlinx.coroutines.flow.MutableStateFlow(0)).collectAsState()
+            val focusRequesters = remember { mutableStateMapOf<Int, FocusRequester>() }
+            suspend fun focusControllerItem(index: Int) {
+                if (
+                    !ControllerHelper.isControllerConnected() ||
+                    isSearchExpanded ||
+                    displayedApps.isEmpty() ||
+                    index !in displayedApps.indices
+                ) {
+                    return
+                }
+                gridState.animateScrollToItem(index)
+                // LazyVerticalGrid only composes the visible window. Wait briefly for
+                // the target cell to register instead of allocating one requester per
+                // owned game up front.
+                repeat(12) {
+                    val requester = focusRequesters[index]
+                    if (requester != null) {
+                        runCatching { requester.requestFocus() }
+                        return
+                    }
+                    kotlinx.coroutines.delay(16L)
+                }
+            }
+
+            // Only a real controller-focus move should reposition an already populated
+            // grid. PICS batches change displayedApps.size frequently and must not drag
+            // mouse/touch users back to item 0.
+            LaunchedEffect(focusIndex) {
+                focusControllerItem(focusIndex)
+            }
+
+            // If the tab was composed before the first Steam batch arrived, initialize
+            // controller focus exactly once when the list transitions empty -> non-empty.
+            LaunchedEffect(displayedApps.isEmpty()) {
+                if (displayedApps.isNotEmpty()) {
+                    focusControllerItem(focusIndex)
+                }
+            }
+            // Right joystick: 2x faster at full push with quadratic speed curve
+            JoystickGridScroll(gridState, activity?.rightStickScrollState, minSpeed = 2.5f, maxSpeed = 16f, quadratic = true)
+            // Left joystick: 75% slower scrolling (vertical only, for browsing store)
+            JoystickGridScroll(gridState, activity?.leftStickScrollState, deadZone = 0.15f, minSpeed = 0.3125f, maxSpeed = 2f)
+            FourByTwoGridView(
+                items = displayedApps,
+                modifier = Modifier.tabScreenPadding(top = TabGridTopPadding),
+                gridState = gridState,
+                keyOf = { it.id },
+            ) { app, index, rowHeight ->
+                val focusRequester = remember(app.id) { FocusRequester() }
+                DisposableEffect(index, focusRequester) {
+                    focusRequesters[index] = focusRequester
+                    onDispose {
+                        if (focusRequesters[index] === focusRequester) {
+                            focusRequesters.remove(index)
+                        }
+                    }
+                }
+                Box(
+                    Modifier
+                        .height(rowHeight)
+                        .focusRequester(focusRequester),
+                ) {
+                    SteamStoreCapsule(
+                        app,
+                        isInstalled = installStateById[app.id] == true,
+                        isFocusedOverride = index == focusIndex,
+                        isControllerActive =
+                            ControllerHelper
+                                .isControllerConnected(),
+                        onClick = { openApp(app) },
+                    )
+                }
+            }
+        }
+
+        AnimatedVisibility(
+            visible = showSyncProgress,
+            modifier =
+                Modifier
+                    .align(Alignment.TopCenter)
+                    .padding(horizontal = 20.dp, vertical = 10.dp)
+                    .zIndex(20f),
+            enter = fadeIn(tween(180)),
+            exit = fadeOut(tween(180)),
+        ) {
+            Surface(
+                shape = RoundedCornerShape(12.dp),
+                tonalElevation = 8.dp,
+                shadowElevation = 8.dp,
+                color = MaterialTheme.colorScheme.surface.copy(alpha = 0.96f),
+            ) {
+                Column(
+                    Modifier
+                        .widthIn(min = 260.dp, max = 420.dp)
+                        .padding(horizontal = 16.dp, vertical = 12.dp),
+                ) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        Text(
+                            text =
+                                if (packageStage) {
+                                    "Discovering Steam library"
+                                } else {
+                                    "Loading Steam metadata"
+                                },
+                            style = MaterialTheme.typography.labelLarge,
+                            fontWeight = FontWeight.SemiBold,
+                        )
+                        Text(
+                            text = "$syncPercent%",
+                            style = MaterialTheme.typography.labelLarge,
+                            fontWeight = FontWeight.Bold,
+                            color = Accent,
+                        )
+                    }
+                    Spacer(Modifier.height(8.dp))
+                    Box(
+                        Modifier
+                            .fillMaxWidth()
+                            .height(6.dp)
+                            .clip(RoundedCornerShape(999.dp))
+                            .background(MaterialTheme.colorScheme.surfaceVariant),
+                    ) {
+                        Box(
+                            Modifier
+                                .fillMaxHeight()
+                                .fillMaxWidth(syncFraction)
+                                .background(Accent),
+                        )
+                    }
+                    Spacer(Modifier.height(6.dp))
+                    Text(
+                        text = "$syncLoaded / $syncTotal",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
             }
         }
     }
@@ -2130,9 +2257,18 @@ internal fun UnifiedActivity.SteamStoreTab(
     }
 }
 
+private fun steamStoreCapsuleUrl(appId: Int): String =
+    "${SteamApp.STEAM_URL}/$appId/header.jpg"
+
+private fun steamStoreSmallCapsuleUrl(appId: Int): String =
+    "${SteamApp.STEAM_URL}/$appId/capsule_231x87.jpg"
+
+private fun steamStoreHeroUrl(appId: Int): String =
+    "${SteamApp.STEAM_URL}/$appId/library_hero.jpg"
+
 @Composable
 internal fun UnifiedActivity.SteamStoreCapsule(
-    app: SteamApp,
+    app: SteamAppSummary,
     isInstalled: Boolean,
     listMode: Boolean = false,
     isFocusedOverride: Boolean = false,
@@ -2178,7 +2314,7 @@ internal fun UnifiedActivity.SteamStoreCapsule(
                 model =
                     ImageRequest
                         .Builder(context)
-                        .data(app.getHeroUrl())
+                        .data(steamStoreHeroUrl(app.id))
                         .crossfade(300)
                         .build(),
                 contentDescription = null,
@@ -2207,7 +2343,7 @@ internal fun UnifiedActivity.SteamStoreCapsule(
                         model =
                             ImageRequest
                                 .Builder(context)
-                                .data(app.getSmallCapsuleUrl())
+                                .data(steamStoreSmallCapsuleUrl(app.id))
                                 .crossfade(300)
                                 .build(),
                         contentDescription = null,
@@ -2264,7 +2400,7 @@ internal fun UnifiedActivity.SteamStoreCapsule(
                     .weight(1f)
                     .clip(RoundedCornerShape(topStart = 16.dp, topEnd = 16.dp)),
             ) {
-                val imageUrl = app.getCapsuleUrl()
+                val imageUrl = steamStoreCapsuleUrl(app.id)
 
                 AsyncImage(
                     model =
