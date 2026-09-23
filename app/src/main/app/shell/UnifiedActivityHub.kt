@@ -1050,16 +1050,10 @@ internal fun UnifiedActivity.UnifiedHub() {
 
                     LaunchedEffect(key) { libraryTabActive.value = (key == "library") }
 
-                    // Keep Library composed so its state survives tab switches.
-                    Box(
-                        Modifier.fillMaxSize().let {
-                            if (key == "library") {
-                                it
-                            } else {
-                                it.alpha(0f).pointerInput(Unit) { /* block ghost taps */ }
-                            }
-                        },
-                    ) {
+                    if (key == "library") {
+                        // Do not keep the Library subtree alive behind other tabs. Its
+                        // file scans, artwork work and Steam install validation are all
+                        // tied to composition and should stop when the user leaves it.
                         LibraryCarousel(
                             isLoggedIn = isLoggedIn,
                             steamApps = filteredInstalledSteamApps,
@@ -1074,9 +1068,7 @@ internal fun UnifiedActivity.UnifiedHub() {
                             searchQuery = searchQuery,
                             isControllerConnected = isControllerConnected,
                         )
-                    }
-
-                    if (key != "library") {
+                    } else {
                         AnimatedContent(
                             targetState = key,
                             transitionSpec = {
