@@ -323,6 +323,7 @@ internal fun UnifiedActivity.UnifiedHub() {
     var showAddCustomGame by remember { mutableStateOf(false) }
     var showExitDialog by remember { mutableStateOf(false) }
     var searchQueryTfv by remember { mutableStateOf(TextFieldValue("")) }
+    var isSearchExpanded by remember { mutableStateOf(false) }
     val searchQuery = searchQueryTfv.text
     var localLibraryRefreshKey by remember { mutableIntStateOf(0) }
     var shortcutDataRefreshKey by remember { mutableIntStateOf(0) }
@@ -991,6 +992,8 @@ internal fun UnifiedActivity.UnifiedHub() {
                     }, persona, context, scope, isControllerConnected, isPS, isLibraryTab, searchQueryTfv, {
                         searchQueryTfv =
                             it
+                    }, isSearchExpanded, {
+                        isSearchExpanded = it
                     }, onFilterClicked = { scope.launch { drawerState.open() } }, onFriendsClicked = { scope.launch { rightDrawerState.open() } }) {
                         if (selectedLibrarySource == "GOG") {
                             globalSettingsGogGame = gogApps.find { it.id == selectedGogGameId }
@@ -1094,6 +1097,7 @@ internal fun UnifiedActivity.UnifiedHub() {
                                         filteredSteamOwnedAppSummaries,
                                         steamLibrarySyncProgress,
                                         searchQuery,
+                                        isSearchExpanded,
                                         LibraryLayoutMode.GRID_4,
                                     )
                                 }
@@ -1547,11 +1551,12 @@ internal fun UnifiedActivity.TopBar(
     isLibraryTab: Boolean,
     searchQuery: TextFieldValue,
     onSearchQueryChange: (TextFieldValue) -> Unit,
+    isSearchExpanded: Boolean,
+    onSearchExpandedChange: (Boolean) -> Unit,
     onFilterClicked: () -> Unit,
     onFriendsClicked: () -> Unit = {},
     onGameSettingsClicked: () -> Unit,
 ) {
-    var isSearchExpanded by remember { mutableStateOf(false) }
     val searchFocusRequester = remember { FocusRequester() }
     val keyboardController = LocalSoftwareKeyboardController.current
     val isDownloadsTab = tabs.getOrNull(selectedIdx)?.key == "downloads"
@@ -1561,7 +1566,7 @@ internal fun UnifiedActivity.TopBar(
     LaunchedEffect(selectedIdx) {
         if (isSearchExpanded) {
             onSearchQueryChange(TextFieldValue(""))
-            isSearchExpanded = false
+            onSearchExpandedChange(false)
         }
     }
 
@@ -1581,9 +1586,9 @@ internal fun UnifiedActivity.TopBar(
             if (!isDownloadsTab) {
                 if (isSearchExpanded) {
                     onSearchQueryChange(TextFieldValue(""))
-                    isSearchExpanded = false
+                    onSearchExpandedChange(false)
                 } else {
-                    isSearchExpanded = true
+                    onSearchExpandedChange(true)
                 }
             }
         }
@@ -1790,9 +1795,9 @@ internal fun UnifiedActivity.TopBar(
                                 if (!isDownloadsTab) {
                                     if (isSearchExpanded) {
                                         onSearchQueryChange(TextFieldValue(""))
-                                        isSearchExpanded = false
+                                        onSearchExpandedChange(false)
                                     } else {
-                                        isSearchExpanded = true
+                                        onSearchExpandedChange(true)
                                     }
                                 }
                             },

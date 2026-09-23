@@ -2008,6 +2008,7 @@ internal fun UnifiedActivity.SteamStoreTab(
     steamApps: List<SteamAppSummary>,
     syncProgress: WnLibrarySyncProgress,
     searchQuery: String = "",
+    isSearchExpanded: Boolean = false,
     layoutMode: LibraryLayoutMode = LibraryLayoutMode.GRID_4,
 ) {
     if (!isLoggedIn && !SteamService.hasStoredCredentials(this)) {
@@ -2105,20 +2106,41 @@ internal fun UnifiedActivity.SteamStoreTab(
         } else {
             val focusIndex by (activity?.storeFocusIndex ?: kotlinx.coroutines.flow.MutableStateFlow(0)).collectAsState()
             val focusRequesters = remember { mutableStateMapOf<Int, FocusRequester>() }
-            LaunchedEffect(focusIndex, displayedApps.size, searchQuery) {
-                if (searchQuery.isEmpty() && displayedApps.isNotEmpty() && focusIndex in displayedApps.indices) {
-                    gridState.animateScrollToItem(focusIndex)
-                    // LazyVerticalGrid only composes the visible window. Wait briefly for
-                    // the target cell to register instead of allocating one requester per
-                    // owned game up front.
-                    repeat(12) {
-                        val requester = focusRequesters[focusIndex]
-                        if (requester != null) {
-                            runCatching { requester.requestFocus() }
-                            return@LaunchedEffect
-                        }
-                        kotlinx.coroutines.delay(16L)
+            suspend fun focusControllerItem(index: Int) {
+                if (
+                    !ControllerHelper.isControllerConnected() ||
+                    isSearchExpanded ||
+                    displayedApps.isEmpty() ||
+                    index !in displayedApps.indices
+                ) {
+                    return
+                }
+                gridState.animateScrollToItem(index)
+                // LazyVerticalGrid only composes the visible window. Wait briefly for
+                // the target cell to register instead of allocating one requester per
+                // owned game up front.
+                repeat(12) {
+                    val requester = focusRequesters[index]
+                    if (requester != null) {
+                        runCatching { requester.requestFocus() }
+                        return
                     }
+                    kotlinx.coroutines.delay(16L)
+                }
+            }
+
+            // Only a real controller-focus move should reposition an already populated
+            // grid. PICS batches change displayedApps.size frequently and must not drag
+            // mouse/touch users back to item 0.
+            LaunchedEffect(focusIndex) {
+                focusControllerItem(focusIndex)
+            }
+
+            // If the tab was composed before the first Steam batch arrived, initialize
+            // controller focus exactly once when the list transitions empty -> non-empty.
+            LaunchedEffect(displayedApps.isEmpty()) {
+                if (displayedApps.isNotEmpty()) {
+                    focusControllerItem(focusIndex)
                 }
             }
             // Right joystick: 2x faster at full push with quadratic speed curve
